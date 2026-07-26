@@ -117,3 +117,36 @@ python3 -m unittest discover -s tests -v
 The suite covers recursive impact, cycles, duplicate captions, shelf-token
 normalization, safe cross-workbook matching, TWBX handling, path traversal, and
 deterministic output.
+
+## V2: local MCP catalog
+
+V2 adds read-only MCP access to the compact JSON produced by V1. Generate JSON
+catalogs first:
+
+```bash
+python3 tableau_doc.py path/to/workbooks --output docs --emit-json
+```
+
+The catalog loader and validation command use only the standard library:
+
+```bash
+python3 tableau_mcp.py --catalog docs --check
+```
+
+Starting the MCP server requires the optional official Python SDK:
+
+```bash
+pip install -r requirements-mcp.txt
+python3 tableau_mcp.py --catalog docs
+```
+
+The server uses stdio and exposes four bounded, read-only tools:
+
+- `search_catalog`: search workbooks, worksheets, and fields;
+- `get_field_impact`: retrieve direct, indirect, and cross-workbook impact;
+- `get_worksheet`: retrieve filters, calculations, and direct fields;
+- `trace_dependencies`: trace upstream or downstream lineage with a depth cap.
+
+No MCP tool reads TWB/TWBX files, queries Tableau Server, accesses business
+data, or modifies the catalog. Copy `mcp_config.example.json` and replace the
+placeholder paths with absolute local paths for the target MCP client.

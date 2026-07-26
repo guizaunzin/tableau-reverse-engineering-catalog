@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "tableau-catalog": {
+      "command": "python3",
+      "args": [
+        "/absolute/path/to/tableau_mcp.py",
+        "--catalog",
+        "/absolute/path/to/generated/docs"
+      ]
+    }
+  }
+}
