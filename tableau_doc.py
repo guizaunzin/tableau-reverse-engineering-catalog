@@ -1215,15 +1215,20 @@ def write_workbook_docs(
     )
 
     ordered_fields = sorted(
-        included, key=lambda value: workbook.fields[value].caption.casefold()
+        included,
+        key=lambda value: (
+            workbook.fields[value].datasource_caption.casefold(),
+            workbook.fields[value].caption.casefold(),
+            workbook.fields[value].datasource.casefold(),
+        ),
     )
     impact_lines = [
         '<a id="top"></a>',
         "",
         f"# {workbook.name} Field Impact",
         "",
-        "| Field | Type | Direct Worksheets | Total Impacted Worksheets |",
-        "|---|---|---:|---:|",
+        "| Datasource | Field | Type | Direct Worksheets | Total Impacted Worksheets |",
+        "|---|---|---|---:|---:|",
     ]
     for key in ordered_fields:
         item = workbook.fields[key]
@@ -1233,7 +1238,8 @@ def write_workbook_docs(
             for sheet in workbook.worksheets
         )
         impact_lines.append(
-            f"| [{markdown_escape(item.caption)}](#{field_slugs[key]}) | "
+            f"| {markdown_escape(item.datasource_caption)} | "
+            f"[{markdown_escape(item.caption)}](#{field_slugs[key]}) | "
             f"{item.field_type} | {direct_count} | {impact_count} |"
         )
     for key in ordered_fields:
