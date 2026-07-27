@@ -240,6 +240,29 @@ class CatalogIndex:
             "warnings": item.get("warnings", []),
         }
 
+    def get_metric_contract(
+        self,
+        workbook: str,
+        metric: str,
+    ) -> dict[str, Any]:
+        workbook_item = self._workbook(workbook)
+        matches = [
+            item
+            for item in workbook_item.get("metric_contracts", [])
+            if str(item.get("metric", "")).casefold() == metric.casefold()
+            or str(item.get("internal_name", "")).casefold()
+            == metric.casefold()
+        ]
+        if len(matches) != 1:
+            raise CatalogError(
+                f"Metric contract not found in "
+                f"{workbook_item['workbook']}: {metric}"
+            )
+        return {
+            "workbook": workbook_item["workbook"],
+            **matches[0],
+        }
+
     def trace_dependencies(
         self,
         workbook: str,
@@ -365,6 +388,14 @@ def create_mcp_server(catalog: CatalogIndex) -> Any:
     ) -> dict[str, Any]:
         """Get filters, direct fields, and calculations for one worksheet."""
         return catalog.get_worksheet(workbook, worksheet)
+
+    @server.tool()
+    def get_metric_contract(
+        workbook: str,
+        metric: str,
+    ) -> dict[str, Any]:
+        """Get the semantic recipe and Tableau contexts for one metric."""
+        return catalog.get_metric_contract(workbook, metric)
 
     @server.tool()
     def trace_dependencies(

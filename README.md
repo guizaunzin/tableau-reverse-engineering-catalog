@@ -90,6 +90,27 @@ names such as `[Calculation_1001]` with visible captions such as
 `[Profit Ratio]` when the mapping is unambiguous. Unknown or ambiguous
 references are preserved and reported instead of guessed.
 
+## Metric contracts
+
+With `--emit-json`, each workbook includes additive `metric_contracts` designed
+to give LLMs a machine-readable starting point for reproducing Tableau metric
+logic. Each contract records:
+
+- the visible and internal datasource names;
+- the raw Tableau formula and resolved dependencies;
+- the calculation scope, such as aggregate, row-level, LOD, or table
+  calculation;
+- worksheet and Dashboard contexts;
+- detected shelf aggregations, approximate dimensional grain, and worksheet
+  filters;
+- an explicit semantic status, limitations, and extraction warnings.
+
+Metric contracts are semantic evidence, not validated SQL. They remain
+`partial` until the physical data model, relationships, Tableau order of
+operations, a target SQL dialect, and result-level validation are available.
+Existing workbook, worksheet, and field keys remain available for consumers of
+the earlier JSON format.
+
 ## Cross-workbook impact
 
 Fields are linked across workbooks only when both workbooks expose the same
@@ -103,8 +124,8 @@ field name. Matching captions alone are never considered sufficient.
 - Unsafe ZIP paths and embedded TWB files larger than 50 MiB are rejected.
 - Connection details and credentials are not extracted or documented.
 - Only worksheet filters are analyzed.
-- Dashboard actions, layout, joins, datasource documentation, SQL generation,
-  Parquet data, LLM calls, and MCP serving are outside V1.
+- Dashboard actions, layout, joins, executable SQL generation, result
+  validation, Parquet data, and LLM calls are not yet implemented.
 - Tableau XML varies by release. Unsupported references remain visible as
   warnings so they can become regression fixtures for later improvements.
 
@@ -140,10 +161,12 @@ pip install -r requirements-mcp.txt
 python3 tableau_mcp.py --catalog docs
 ```
 
-The server uses stdio and exposes four bounded, read-only tools:
+The server uses stdio and exposes five bounded, read-only tools:
 
 - `search_catalog`: search workbooks, worksheets, and fields;
 - `get_field_impact`: retrieve direct, indirect, and cross-workbook impact;
+- `get_metric_contract`: retrieve a metric's semantic recipe and Tableau
+  contexts;
 - `get_worksheet`: retrieve filters, calculations, and direct fields;
 - `trace_dependencies`: trace upstream or downstream lineage with a depth cap.
 
