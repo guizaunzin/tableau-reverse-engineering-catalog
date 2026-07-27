@@ -82,6 +82,7 @@ class CatalogError(RuntimeError):
 class Field:
     key: str
     datasource: str
+    datasource_caption: str
     datasource_identity: str | None
     internal_name: str
     caption: str
@@ -202,6 +203,13 @@ def unbracket(value: str) -> str:
     return value
 
 
+def is_generated_measure_field(value: str) -> bool:
+    """Identify Tableau's synthetic Measure Names/Measure Values fields."""
+    _, token = reference_parts(value)
+    normalized = re.sub(r"[^a-z]", "", unbracket(token).casefold())
+    return normalized in {"measurenames", "measurevalues"}
+
+
 def field_key(datasource: str, internal_name: str) -> str:
     return f"{datasource}\x1f{internal_name}"
 
@@ -280,6 +288,7 @@ def build_field_catalog(root: ET.Element) -> dict[str, Field]:
             or datasource.get("caption")
             or "unknown-datasource"
         )
+        datasource_caption = datasource.get("caption") or datasource_name
         repository = next(
             (
                 node
@@ -302,6 +311,10 @@ def build_field_catalog(root: ET.Element) -> dict[str, Field]:
             internal = column.get("name")
             if not internal or not internal.startswith("["):
                 continue
+            if is_generated_measure_field(internal) or is_generated_measure_field(
+                column.get("caption") or ""
+            ):
+                continue
             calculation = next(
                 (
                     child
@@ -318,6 +331,7 @@ def build_field_catalog(root: ET.Element) -> dict[str, Field]:
             candidate = Field(
                 key=key,
                 datasource=datasource_name,
+                datasource_caption=datasource_caption,
                 datasource_identity=datasource_identity,
                 internal_name=internal,
                 caption=column.get("caption") or unbracket(internal.split(".")[-1]),
@@ -459,6 +473,8 @@ def references_from_element(
                     values.append(value)
             for value in values:
                 for match in FIELD_REFERENCE_RE.finditer(value):
+                    if is_generated_measure_field(match.group(0)):
+                        continue
                     key, warning = resolve_reference(match.group(0), fields)
                     if key:
                         resolved.add(key)
@@ -511,6 +527,9 @@ def extract_worksheets(
             extract_filter(item, fields)
             for item in node.iter()
             if local_name(item.tag) == "filter"
+            and not is_generated_measure_field(
+                item.get("column") or item.get("field") or ""
+            )
         ]
         direct.update(
             item.field_key for item in filters if item.field_key is not None
@@ -877,7 +896,7 @@ def field_page(
         f"## {item.caption}",
         "",
         f"**Type:** {item.field_type}  ",
-        f"**Datasource:** {item.datasource}",
+        f"**Datasource:** {item.datasource_caption}",
         "",
     ]
     if item.raw_formula is not None and not item.is_parameter:
@@ -970,6 +989,7 @@ def field_page(
     if item.warnings:
         lines.extend(["", "### Warnings", ""])
         lines.extend(f"- {warning}" for warning in item.warnings)
+    lines.extend(["", "[↑ Back to top](#top)"])
     return "\n".join(lines).rstrip() + "\n"
 
 
@@ -1086,7 +1106,7 @@ def write_workbook_docs(
         workbook.worksheets, key=lambda item: item.name.casefold()
     )
     worksheets_lines = [
-        "# Worksheets",
+        f"# {workbook.name} Worksheets",
         "",
         f"Workbook: **{workbook.name}**",
         "",
@@ -1120,6 +1140,8 @@ def write_workbook_docs(
         included, key=lambda value: workbook.fields[value].caption.casefold()
     )
     impact_lines = [
+        '<a id="top"></a>',
+        "",
         f"# {workbook.name} Field Impact",
         "",
         "| Field | Type | Direct Worksheets | Total Impacted Worksheets |",
