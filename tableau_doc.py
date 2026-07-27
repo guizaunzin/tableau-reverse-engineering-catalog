@@ -122,11 +122,18 @@ class Worksheet:
 
 
 @dataclass
+class Dashboard:
+    name: str
+    worksheets: list[str] = field(default_factory=list)
+
+
+@dataclass
 class Workbook:
     name: str
     source: str
     fields: dict[str, Field]
     worksheets: list[Worksheet]
+    dashboards: list[Dashboard] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
 
 
@@ -551,17 +558,45 @@ def extract_worksheets(
     return worksheets
 
 
+def extract_dashboards(
+    root: ET.Element,
+    worksheets: list[Worksheet],
+) -> list[Dashboard]:
+    worksheet_names = {worksheet.name for worksheet in worksheets}
+    dashboards: list[Dashboard] = []
+    for node in (
+        item for item in root.iter() if local_name(item.tag) == "dashboard"
+    ):
+        name = node.get("name")
+        if not name:
+            continue
+        referenced: list[str] = []
+        for zone in (
+            item for item in node.iter() if local_name(item.tag) == "zone"
+        ):
+            worksheet_name = zone.get("name") or zone.get("worksheet")
+            if (
+                worksheet_name in worksheet_names
+                and worksheet_name not in referenced
+            ):
+                referenced.append(worksheet_name)
+        dashboards.append(Dashboard(name=name, worksheets=referenced))
+    return dashboards
+
+
 def parse_workbook(path: Path) -> Workbook:
     root = parse_xml(read_workbook_xml(path), path)
     fields = build_field_catalog(root)
     resolve_formulas(fields)
     worksheets = extract_worksheets(root, fields)
+    dashboards = extract_dashboards(root, worksheets)
     name = root.get("name") or path.stem
     workbook = Workbook(
         name=name,
         source=path.name,
         fields=fields,
         worksheets=worksheets,
+        dashboards=dashboards,
     )
     detect_cycles(workbook, relevant_fields(workbook))
     return workbook
@@ -1077,6 +1112,13 @@ def workbook_payload(
         "schema_version": SCHEMA_VERSION,
         "workbook": workbook.name,
         "source": workbook.source,
+        "dashboards": [
+            {
+                "name": dashboard.name,
+                "worksheets": dashboard.worksheets,
+            }
+            for dashboard in workbook.dashboards
+        ],
         "worksheets": worksheets_payload,
         "fields": fields_payload,
         "warnings": workbook.warnings,
@@ -1113,10 +1155,46 @@ def write_workbook_docs(
         "## Contents",
         "",
     ]
-    for worksheet in ordered_worksheets:
-        worksheets_lines.append(
-            f"- [{worksheet.name}](#{worksheet_slugs[worksheet.name]})"
-        )
+    if workbook.dashboards:
+        worksheet_by_name = {
+            worksheet.name: worksheet for worksheet in workbook.worksheets
+        }
+        assigned_worksheets: set[str] = set()
+        for dashboard in workbook.dashboards:
+            worksheets_lines.extend(
+                [f"### Dashboard: {dashboard.name}", ""]
+            )
+            dashboard_worksheets = [
+                worksheet_by_name[name]
+                for name in dashboard.worksheets
+                if name in worksheet_by_name
+            ]
+            if dashboard_worksheets:
+                for worksheet in dashboard_worksheets:
+                    assigned_worksheets.add(worksheet.name)
+                    worksheets_lines.append(
+                        f"- [{worksheet.name}]"
+                        f"(#{worksheet_slugs[worksheet.name]})"
+                    )
+            else:
+                worksheets_lines.append("No worksheets detected.")
+            worksheets_lines.append("")
+        unassigned_worksheets = [
+            worksheet
+            for worksheet in ordered_worksheets
+            if worksheet.name not in assigned_worksheets
+        ]
+        if unassigned_worksheets:
+            worksheets_lines.extend(["### Not used in a Dashboard", ""])
+            for worksheet in unassigned_worksheets:
+                worksheets_lines.append(
+                    f"- [{worksheet.name}](#{worksheet_slugs[worksheet.name]})"
+                )
+    else:
+        for worksheet in ordered_worksheets:
+            worksheets_lines.append(
+                f"- [{worksheet.name}](#{worksheet_slugs[worksheet.name]})"
+            )
     for worksheet in ordered_worksheets:
         worksheets_lines.extend(
             [
@@ -1137,15 +1215,20 @@ def write_workbook_docs(
     )
 
     ordered_fields = sorted(
-        included, key=lambda value: workbook.fields[value].caption.casefold()
+        included,
+        key=lambda value: (
+            workbook.fields[value].datasource_caption.casefold(),
+            workbook.fields[value].caption.casefold(),
+            workbook.fields[value].datasource.casefold(),
+        ),
     )
     impact_lines = [
         '<a id="top"></a>',
         "",
         f"# {workbook.name} Field Impact",
         "",
-        "| Field | Type | Direct Worksheets | Total Impacted Worksheets |",
-        "|---|---|---:|---:|",
+        "| Datasource | Field | Type | Direct Worksheets | Total Impacted Worksheets |",
+        "|---|---|---|---:|---:|",
     ]
     for key in ordered_fields:
         item = workbook.fields[key]
@@ -1155,7 +1238,8 @@ def write_workbook_docs(
             for sheet in workbook.worksheets
         )
         impact_lines.append(
-            f"| [{markdown_escape(item.caption)}](#{field_slugs[key]}) | "
+            f"| {markdown_escape(item.datasource_caption)} | "
+            f"[{markdown_escape(item.caption)}](#{field_slugs[key]}) | "
             f"{item.field_type} | {direct_count} | {impact_count} |"
         )
     for key in ordered_fields:
