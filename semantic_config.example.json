@@ -2,6 +2,7 @@
   "version": 1,
   "datasources": {
     "Commercial Metrics": {
+      "review_status": "approved",
       "description": "Approved semantic source for commercial reporting.",
       "table": "commercial_metrics",
       "connection": {

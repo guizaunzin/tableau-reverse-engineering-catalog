@@ -133,6 +133,45 @@ Names such as `Region` and `Revenue` form the contract presented to the LLM.
 The `column` and `table` values are physical identifiers controlled by the
 data team.
 
+### Generate a draft automatically
+
+After generating workbook JSON catalogs with `--emit-json`, create an initial
+semantic configuration draft:
+
+```bash
+python3 semantic_config_bootstrap.py docs \
+  --output semantic_config.draft.json
+```
+
+The bootstrap script:
+
+- groups metric contracts by visible Tableau datasource;
+- suggests dimensions from the detected worksheet grain;
+- suggests physical column names from Tableau field names;
+- converts base measures and simple formulas such as `SUM([Members])`;
+- infers draft aggregation policies from Tableau contexts;
+- places compound formulas, LODs, and table calculations in
+  `unsupported_metric_contracts`.
+
+Every generated datasource is marked:
+
+```json
+"review_status": "needs_review"
+```
+
+The MCP server refuses to load such a datasource. Before using the draft:
+
+1. confirm the physical table and database path;
+2. confirm every suggested physical column;
+3. replace generated descriptions with approved business definitions;
+4. confirm default and allowed aggregation policies;
+5. review `unsupported_metric_contracts`;
+6. change the datasource status to `"review_status": "approved"`;
+7. save the reviewed file as `semantic_config.json`.
+
+The bootstrap is intentionally conservative. It accelerates mapping but does
+not claim that Tableau captions are physical database columns.
+
 ## Running locally
 
 Generate the catalog first:
@@ -183,68 +222,6 @@ To answer "What was revenue by region?":
    limitations.
 
 The LLM should not skip directly to `get_data` and invent field names.
-
-## Recommended next steps at work
-
-### 1. Select a small pilot
-
-Choose an important dashboard with two or three metrics and known Tableau
-reference values.
-
-### 2. Define owners
-
-For each metric, identify its business owner, data owner, approved datasource
-and table, definition, default aggregation, exceptions, and authorized
-dimensions.
-
-### 3. Populate the configuration
-
-Map only approved fields. A small allowlist makes the behavior safer and
-easier to validate.
-
-### 4. Validate against Tableau
-
-Compare queries across known date and dimension combinations. Record the
-Tableau value, MCP value, filters, difference, root cause, and owner approval.
-A metric should be presented as equivalent only after this validation.
-
-### 5. Select the corporate adapter
-
-The current executor supports read-only SQLite. For production, the team should
-select Snowflake, BigQuery, SQL Server, or another warehouse. The adapter
-should:
-
-- use credentials managed outside the configuration;
-- execute with a read-only role;
-- apply timeouts, cost controls, and row limits;
-- retain the same validation and restricted compiler;
-- record audit events without storing sensitive results.
-
-### 6. Run a user pilot
-
-Test whether the LLM selects the correct metric, uses the default aggregation,
-asks for missing context, states limitations, and reproduces validated values.
-
-## How to present this to your manager
-
-A concise narrative:
-
-> People currently treat Tableau as a golden source, but an LLM does not know
-> the rules that produced those numbers. We built a layer that extracts metric
-> definitions from Tableau and exposes only approved dimensions, indicators,
-> and aggregations. The LLM does not write unrestricted SQL: it requests
-> business concepts, the server validates those concepts, and then generates a
-> bounded, read-only query. The next step is to validate a small set of metrics
-> against a real dashboard and connect the same mechanism to our corporate
-> warehouse.
-
-For a demonstration:
-
-1. show `get_metric_contract("Revenue")`;
-2. show `get_indicators()` and the `sum` policy;
-3. try an invalid dimension and show the rejection;
-4. execute a valid query grouped by `Region`;
-5. compare the result with a known Tableau value.
 
 ## Current state and limitations
 

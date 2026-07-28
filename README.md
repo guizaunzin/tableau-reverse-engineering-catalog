@@ -30,6 +30,19 @@ Scan every `.twb` and `.twbx` below a directory:
 python3 tableau_doc.py path/to/workbooks --output docs
 ```
 
+Generate a review-required semantic configuration draft from emitted JSON
+catalogs:
+
+```bash
+python3 tableau_doc.py path/to/workbooks --output docs --emit-json
+python3 semantic_config_bootstrap.py docs \
+  --output semantic_config.draft.json
+```
+
+Review table names, column mappings, descriptions, and aggregation policies
+before changing each datasource from `needs_review` to `approved`. See
+[MCP_SERVER.md](MCP_SERVER.md) for the complete workflow.
+
 Also generate the compact machine-readable representation:
 
 ```bash

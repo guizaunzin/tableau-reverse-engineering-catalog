@@ -79,6 +79,12 @@ class SemanticQueryService:
     def _validate_datasource(name: str, datasource: object) -> None:
         if not isinstance(datasource, dict):
             raise CatalogError(f"Datasource {name} must be an object.")
+        review_status = datasource.get("review_status", "approved")
+        if review_status != "approved":
+            raise CatalogError(
+                f"Datasource {name} must be approved before MCP use; "
+                f"current review_status is {review_status}."
+            )
         table = datasource.get("table")
         if (
             not isinstance(table, str)
