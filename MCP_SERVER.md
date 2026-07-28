@@ -133,6 +133,45 @@ Names such as `Region` and `Revenue` form the contract presented to the LLM.
 The `column` and `table` values are physical identifiers controlled by the
 data team.
 
+### Generate a draft automatically
+
+After generating workbook JSON catalogs with `--emit-json`, create an initial
+semantic configuration draft:
+
+```bash
+python3 semantic_config_bootstrap.py docs \
+  --output semantic_config.draft.json
+```
+
+The bootstrap script:
+
+- groups metric contracts by visible Tableau datasource;
+- suggests dimensions from the detected worksheet grain;
+- suggests physical column names from Tableau field names;
+- converts base measures and simple formulas such as `SUM([Members])`;
+- infers draft aggregation policies from Tableau contexts;
+- places compound formulas, LODs, and table calculations in
+  `unsupported_metric_contracts`.
+
+Every generated datasource is marked:
+
+```json
+"review_status": "needs_review"
+```
+
+The MCP server refuses to load such a datasource. Before using the draft:
+
+1. confirm the physical table and database path;
+2. confirm every suggested physical column;
+3. replace generated descriptions with approved business definitions;
+4. confirm default and allowed aggregation policies;
+5. review `unsupported_metric_contracts`;
+6. change the datasource status to `"review_status": "approved"`;
+7. save the reviewed file as `semantic_config.json`.
+
+The bootstrap is intentionally conservative. It accelerates mapping but does
+not claim that Tableau captions are physical database columns.
+
 ## Running locally
 
 Generate the catalog first:
