@@ -11,6 +11,8 @@ navigable Markdown catalog focused on:
 - worksheets affected directly or indirectly by a field change.
 
 It uses only the Python standard library and never connects to Tableau Server.
+For the MCP architecture, secure semantic query layer, workplace rollout, and
+presentation guidance, see [MCP_SERVER.md](MCP_SERVER.md).
 
 ## Quick start
 
@@ -151,25 +153,36 @@ python3 tableau_doc.py path/to/workbooks --output docs --emit-json
 The catalog loader and validation command use only the standard library:
 
 ```bash
-python3 tableau_mcp.py --catalog docs --check
+python3 tableau_mcp.py \
+  --catalog docs \
+  --semantic-config semantic_config.json \
+  --check
 ```
 
 Starting the MCP server requires the optional official Python SDK:
 
 ```bash
 pip install -r requirements-mcp.txt
-python3 tableau_mcp.py --catalog docs
+python3 tableau_mcp.py \
+  --catalog docs \
+  --semantic-config semantic_config.json
 ```
 
-The server uses stdio and exposes five bounded, read-only tools:
+The server uses stdio and exposes eight bounded, read-only tools:
 
 - `search_catalog`: search workbooks, worksheets, and fields;
 - `get_field_impact`: retrieve direct, indirect, and cross-workbook impact;
 - `get_metric_contract`: retrieve a metric's semantic recipe and Tableau
   contexts;
+- `get_dimensions`: list configured dimensions with descriptions;
+- `get_indicators`: list indicators with descriptions and aggregation policies;
+- `get_data`: execute a bounded query compiled from validated semantic inputs;
 - `get_worksheet`: retrieve filters, calculations, and direct fields;
 - `trace_dependencies`: trace upstream or downstream lineage with a depth cap.
 
-No MCP tool reads TWB/TWBX files, queries Tableau Server, accesses business
-data, or modifies the catalog. Copy `mcp_config.example.json` and replace the
-placeholder paths with absolute local paths for the target MCP client.
+No MCP tool reads TWB/TWBX files, queries Tableau Server, or modifies the
+catalog. `get_data` can read only the datasource configured in
+`semantic_config.json`; the initial adapter opens SQLite in read-only mode and
+returns at most 1,000 rows. Copy `mcp_config.example.json` and replace the
+placeholder paths with absolute local paths for the target MCP client. See
+[MCP_SERVER.md](MCP_SERVER.md) for the security model and rollout guide.
