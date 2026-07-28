@@ -113,10 +113,18 @@ class FilterInfo:
     warnings: list[str] = field(default_factory=list)
 
 
+@dataclass(frozen=True)
+class FieldUsage:
+    field_key: str
+    context: str
+    aggregation: str | None = None
+
+
 @dataclass
 class Worksheet:
     name: str
     direct_fields: set[str] = field(default_factory=set)
+    field_usages: list[FieldUsage] = field(default_factory=list)
     filters: list[FilterInfo] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
 
@@ -377,6 +385,20 @@ def normalize_shelf_token(token: str) -> str:
     return f"[{value}]"
 
 
+def aggregation_from_reference(reference: str) -> str | None:
+    parts = re.findall(r"\[[^\]]+\]", reference)
+    if not parts:
+        return None
+    tokens = unbracket(parts[-1]).split(":")
+    if (
+        len(tokens) >= 3
+        and tokens[-1].casefold() in {"nk", "ok", "qk", "sk", "tk"}
+        and tokens[0].casefold() != "none"
+    ):
+        return tokens[0].casefold()
+    return None
+
+
 def resolve_reference(
     reference: str,
     fields: dict[str, Field],
@@ -459,9 +481,10 @@ def resolve_formulas(fields: dict[str, Field]) -> None:
 def references_from_element(
     worksheet_node: ET.Element,
     fields: dict[str, Field],
-) -> tuple[set[str], list[str]]:
+) -> tuple[set[str], list[str], list[FieldUsage]]:
     resolved: set[str] = set()
     warnings: list[str] = []
+    usages: list[FieldUsage] = []
 
     def visit(node: ET.Element, inside_dependencies: bool = False) -> None:
         name = local_name(node.tag)
@@ -485,13 +508,22 @@ def references_from_element(
                     key, warning = resolve_reference(match.group(0), fields)
                     if key:
                         resolved.add(key)
+                        usage = FieldUsage(
+                            field_key=key,
+                            context=name,
+                            aggregation=aggregation_from_reference(
+                                match.group(0)
+                            ),
+                        )
+                        if usage not in usages:
+                            usages.append(usage)
                     elif warning and warning not in warnings:
                         warnings.append(warning)
         for child in node:
             visit(child, inside_dependencies)
 
     visit(worksheet_node)
-    return resolved, warnings
+    return resolved, warnings, usages
 
 
 def extract_filter(
@@ -529,7 +561,7 @@ def extract_worksheets(
     worksheets: list[Worksheet] = []
     for node in (item for item in root.iter() if local_name(item.tag) == "worksheet"):
         name = node.get("name") or "Unnamed Worksheet"
-        direct, warnings = references_from_element(node, fields)
+        direct, warnings, usages = references_from_element(node, fields)
         filters = [
             extract_filter(item, fields)
             for item in node.iter()
@@ -551,6 +583,7 @@ def extract_worksheets(
             Worksheet(
                 name=name,
                 direct_fields=direct,
+                field_usages=usages,
                 filters=filters,
                 warnings=warnings,
             )
@@ -1028,6 +1061,132 @@ def field_page(
     return "\n".join(lines).rstrip() + "\n"
 
 
+def metric_calculation_scope(item: Field) -> str:
+    classification = formula_classification(
+        item.raw_formula, item.is_parameter
+    ).casefold()
+    if classification == "aggregate calculation":
+        return "aggregate"
+    if classification == "lod":
+        return "lod"
+    if classification == "table calculation":
+        return "table_calculation"
+    if item.raw_formula is not None:
+        return "row_level"
+    return "base_measure"
+
+
+def metric_contracts(
+    workbook: Workbook,
+    included: set[str],
+    reverse: dict[str, set[str]],
+) -> list[dict[str, object]]:
+    dashboards_by_worksheet: dict[str, list[str]] = defaultdict(list)
+    for dashboard in workbook.dashboards:
+        for worksheet_name in dashboard.worksheets:
+            dashboards_by_worksheet[worksheet_name].append(dashboard.name)
+
+    contracts: list[dict[str, object]] = []
+    metric_keys = [
+        key
+        for key in included
+        if not workbook.fields[key].is_parameter
+        and (
+            (workbook.fields[key].role or "").casefold() == "measure"
+            or (
+                workbook.fields[key].raw_formula is not None
+                and (workbook.fields[key].role or "").casefold()
+                != "dimension"
+            )
+        )
+    ]
+    for key in sorted(
+        metric_keys,
+        key=lambda value: (
+            workbook.fields[value].datasource_caption.casefold(),
+            workbook.fields[value].caption.casefold(),
+        ),
+    ):
+        item = workbook.fields[key]
+        contexts: list[dict[str, object]] = []
+        for worksheet in sorted(
+            workbook.worksheets, key=lambda value: value.name.casefold()
+        ):
+            path = shortest_impact_path(key, worksheet, reverse)
+            if path is None:
+                continue
+            aggregations = sorted(
+                {
+                    usage.aggregation
+                    for usage in worksheet.field_usages
+                    if usage.field_key == key
+                    and usage.aggregation is not None
+                }
+            )
+            grain = sorted(
+                {
+                    workbook.fields[usage.field_key].caption
+                    for usage in worksheet.field_usages
+                    if usage.context
+                    in {"rows", "cols", "columns", "detail"}
+                    and usage.field_key in workbook.fields
+                    and (
+                        workbook.fields[usage.field_key].role or ""
+                    ).casefold()
+                    == "dimension"
+                },
+                key=str.casefold,
+            )
+            contexts.append(
+                {
+                    "worksheet": worksheet.name,
+                    "dashboards": dashboards_by_worksheet.get(
+                        worksheet.name, []
+                    ),
+                    "usage": "direct" if len(path) == 1 else "indirect",
+                    "aggregations": aggregations,
+                    "grain": grain,
+                    "filters": [
+                        {
+                            "field": filter_info.field_label,
+                            "operator": filter_info.operator,
+                            "value": filter_info.value,
+                        }
+                        for filter_info in worksheet.filters
+                    ],
+                }
+            )
+        contracts.append(
+            {
+                "metric": item.caption,
+                "internal_name": item.internal_name,
+                "datasource": item.datasource_caption,
+                "datasource_internal": item.datasource,
+                "field_type": item.field_type,
+                "formula_tableau": item.raw_formula,
+                "formula_display": item.display_formula,
+                "calculation_scope": metric_calculation_scope(item),
+                "dependencies": [
+                    workbook.fields[dependency].caption
+                    for dependency in item.dependencies
+                    if dependency in included
+                ],
+                "contexts": contexts,
+                "semantic_status": (
+                    "unresolved" if item.warnings else "partial"
+                ),
+                "limitations": [
+                    "physical_model_not_extracted",
+                    "relationships_and_joins_not_extracted",
+                    "tableau_order_of_operations_not_fully_modeled",
+                    "sql_dialect_not_selected",
+                ],
+                "warnings": item.warnings,
+            }
+        )
+    return contracts
+
+
 def workbook_payload(
     workbook: Workbook,
     included: set[str],
@@ -1060,6 +1219,15 @@ def workbook_payload(
                         "value": item.value,
                     }
                     for item in worksheet.filters
+                ],
+                "field_usages": [
+                    {
+                        "field": workbook.fields[usage.field_key].caption,
+                        "context": usage.context,
+                        "aggregation": usage.aggregation,
+                    }
+                    for usage in worksheet.field_usages
+                    if usage.field_key in workbook.fields
                 ],
                 "warnings": worksheet.warnings,
             }
@@ -1119,6 +1287,9 @@ def workbook_payload(
             }
             for dashboard in workbook.dashboards
         ],
+        "metric_contracts": metric_contracts(
+            workbook, included, reverse
+        ),
         "worksheets": worksheets_payload,
         "fields": fields_payload,
         "warnings": workbook.warnings,

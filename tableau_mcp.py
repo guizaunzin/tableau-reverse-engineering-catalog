@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
+import sqlite3
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -13,6 +15,370 @@ from typing import Any
 
 class CatalogError(RuntimeError):
     """A user-facing catalog loading error."""
+
+
+SAFE_SQL_IDENTIFIER_RE = re.compile(
+    r"^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*$"
+)
+SUPPORTED_AGGREGATIONS = {
+    "avg",
+    "count",
+    "count_distinct",
+    "max",
+    "min",
+    "sum",
+}
+
+
+@dataclass
+class SemanticQueryService:
+    config: dict[str, Any]
+    base_dir: Path
+
+    @classmethod
+    def from_file(cls, path: Path) -> "SemanticQueryService":
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise CatalogError(
+                f"Invalid semantic configuration {path}: {exc}"
+            ) from exc
+        return cls.from_config(payload, base_dir=path.parent)
+
+    @classmethod
+    def from_config(
+        cls,
+        payload: object,
+        *,
+        base_dir: Path,
+    ) -> "SemanticQueryService":
+        if not isinstance(payload, dict) or payload.get("version") != 1:
+            raise CatalogError(
+                "Semantic configuration must be an object with version 1."
+            )
+        datasources = payload.get("datasources")
+        if not isinstance(datasources, dict) or not datasources:
+            raise CatalogError(
+                "Semantic configuration must define at least one datasource."
+            )
+        seen_names: set[str] = set()
+        for datasource_name, datasource in datasources.items():
+            if (
+                not isinstance(datasource_name, str)
+                or not datasource_name.strip()
+                or datasource_name.casefold() in seen_names
+            ):
+                raise CatalogError(
+                    f"Invalid or duplicate datasource name: {datasource_name}"
+                )
+            seen_names.add(datasource_name.casefold())
+            cls._validate_datasource(datasource_name, datasource)
+        return cls(config=payload, base_dir=base_dir)
+
+    @staticmethod
+    def _validate_datasource(name: str, datasource: object) -> None:
+        if not isinstance(datasource, dict):
+            raise CatalogError(f"Datasource {name} must be an object.")
+        table = datasource.get("table")
+        if (
+            not isinstance(table, str)
+            or not SAFE_SQL_IDENTIFIER_RE.fullmatch(table)
+        ):
+            raise CatalogError(f"Unsafe table identifier in datasource {name}.")
+        connection = datasource.get("connection")
+        if (
+            not isinstance(connection, dict)
+            or connection.get("driver") != "sqlite"
+            or not isinstance(connection.get("database"), str)
+            or not connection["database"]
+        ):
+            raise CatalogError(
+                f"Datasource {name} must define a SQLite connection."
+            )
+        for collection_name in ("dimensions", "indicators"):
+            collection = datasource.get(collection_name)
+            if not isinstance(collection, dict):
+                raise CatalogError(
+                    f"Datasource {name} must define {collection_name}."
+                )
+            seen_fields: set[str] = set()
+            for field_name, definition in collection.items():
+                if (
+                    not isinstance(field_name, str)
+                    or not field_name.strip()
+                    or field_name.casefold() in seen_fields
+                    or not isinstance(definition, dict)
+                ):
+                    raise CatalogError(
+                        f"Invalid {collection_name} entry in datasource {name}."
+                    )
+                seen_fields.add(field_name.casefold())
+                column = definition.get("column")
+                description = definition.get("description")
+                if (
+                    not isinstance(column, str)
+                    or not SAFE_SQL_IDENTIFIER_RE.fullmatch(column)
+                    or not isinstance(description, str)
+                    or not description.strip()
+                ):
+                    raise CatalogError(
+                        f"Invalid {field_name} definition in datasource {name}."
+                    )
+                if collection_name == "indicators":
+                    default = definition.get("default_aggregation")
+                    allowed = definition.get("allowed_aggregations")
+                    if (
+                        not isinstance(default, str)
+                        or not isinstance(allowed, list)
+                        or not allowed
+                        or any(
+                            not isinstance(value, str)
+                            or value not in SUPPORTED_AGGREGATIONS
+                            for value in allowed
+                        )
+                        or default not in allowed
+                    ):
+                        raise CatalogError(
+                            f"Invalid aggregation policy for {field_name} "
+                            f"in datasource {name}."
+                        )
+
+    def _datasource(self, name: str) -> tuple[str, dict[str, Any]]:
+        matches = [
+            (datasource_name, datasource)
+            for datasource_name, datasource in self.config[
+                "datasources"
+            ].items()
+            if datasource_name.casefold() == name.casefold()
+        ]
+        if len(matches) != 1:
+            raise CatalogError(f"Semantic datasource not found: {name}")
+        return matches[0]
+
+    def get_dimensions(self, datasource: str) -> dict[str, Any]:
+        datasource_name, definition = self._datasource(datasource)
+        return {
+            "datasource": datasource_name,
+            "description": definition.get("description", ""),
+            "dimensions": [
+                {
+                    "name": name,
+                    "column": item["column"],
+                    "description": item["description"],
+                }
+                for name, item in sorted(
+                    definition["dimensions"].items(),
+                    key=lambda pair: pair[0].casefold(),
+                )
+            ],
+        }
+
+    def get_indicators(self, datasource: str) -> dict[str, Any]:
+        datasource_name, definition = self._datasource(datasource)
+        return {
+            "datasource": datasource_name,
+            "description": definition.get("description", ""),
+            "indicators": [
+                {
+                    "name": name,
+                    "column": item["column"],
+                    "description": item["description"],
+                    "default_aggregation": item["default_aggregation"],
+                    "allowed_aggregations": item[
+                        "allowed_aggregations"
+                    ],
+                }
+                for name, item in sorted(
+                    definition["indicators"].items(),
+                    key=lambda pair: pair[0].casefold(),
+                )
+            ],
+        }
+
+    @staticmethod
+    def _quote_identifier(identifier: str) -> str:
+        if not SAFE_SQL_IDENTIFIER_RE.fullmatch(identifier):
+            raise CatalogError(f"Unsafe configured SQL identifier: {identifier}")
+        return ".".join(f'"{part}"' for part in identifier.split("."))
+
+    @staticmethod
+    def _quote_alias(alias: str) -> str:
+        return f'"{alias.replace(chr(34), chr(34) * 2)}"'
+
+    @staticmethod
+    def _select_named_items(
+        requested: object,
+        configured: dict[str, dict[str, Any]],
+        *,
+        kind: str,
+        maximum: int,
+        allow_empty: bool,
+    ) -> list[tuple[str, dict[str, Any]]]:
+        if (
+            not isinstance(requested, list)
+            or any(not isinstance(value, str) for value in requested)
+            or len(requested) > maximum
+            or (not allow_empty and not requested)
+        ):
+            raise CatalogError(
+                f"{kind.title()} selection must contain between "
+                f"{0 if allow_empty else 1} and {maximum} names."
+            )
+        configured_by_name = {
+            name.casefold(): (name, definition)
+            for name, definition in configured.items()
+        }
+        selected: list[tuple[str, dict[str, Any]]] = []
+        seen: set[str] = set()
+        for requested_name in requested:
+            match = configured_by_name.get(requested_name.casefold())
+            if match is None:
+                raise CatalogError(f"Unknown {kind}: {requested_name}")
+            if match[0].casefold() in seen:
+                raise CatalogError(f"Duplicate {kind}: {requested_name}")
+            seen.add(match[0].casefold())
+            selected.append(match)
+        return selected
+
+    @staticmethod
+    def _aggregate_sql(aggregation: str, column_sql: str) -> str:
+        if aggregation == "count_distinct":
+            return f"COUNT(DISTINCT {column_sql})"
+        functions = {
+            "avg": "AVG",
+            "count": "COUNT",
+            "max": "MAX",
+            "min": "MIN",
+            "sum": "SUM",
+        }
+        function = functions.get(aggregation)
+        if function is None:
+            raise CatalogError(f"Unsupported aggregation: {aggregation}")
+        return f"{function}({column_sql})"
+
+    def get_data(
+        self,
+        datasource: str,
+        *,
+        dimensions: list[str],
+        indicators: list[str],
+        aggregations: dict[str, str] | None = None,
+        limit: int = 100,
+    ) -> dict[str, Any]:
+        datasource_name, definition = self._datasource(datasource)
+        selected_dimensions = self._select_named_items(
+            dimensions,
+            definition["dimensions"],
+            kind="dimension",
+            maximum=10,
+            allow_empty=True,
+        )
+        selected_indicators = self._select_named_items(
+            indicators,
+            definition["indicators"],
+            kind="indicator",
+            maximum=20,
+            allow_empty=False,
+        )
+        if (
+            isinstance(limit, bool)
+            or not isinstance(limit, int)
+            or not 1 <= limit <= 1000
+        ):
+            raise CatalogError("Query limit must be between 1 and 1000.")
+        if aggregations is None:
+            aggregations = {}
+        if not isinstance(aggregations, dict) or any(
+            not isinstance(name, str) or not isinstance(value, str)
+            for name, value in aggregations.items()
+        ):
+            raise CatalogError("Aggregations must map indicators to policies.")
+
+        selected_indicator_names = {
+            name.casefold(): name for name, _ in selected_indicators
+        }
+        requested_aggregations: dict[str, str] = {}
+        for requested_name, aggregation in aggregations.items():
+            selected_name = selected_indicator_names.get(
+                requested_name.casefold()
+            )
+            if selected_name is None:
+                raise CatalogError(
+                    f"Aggregation provided for unselected indicator: "
+                    f"{requested_name}"
+                )
+            requested_aggregations[selected_name] = aggregation.casefold()
+
+        select_parts: list[str] = []
+        group_parts: list[str] = []
+        for name, item in selected_dimensions:
+            column_sql = self._quote_identifier(item["column"])
+            select_parts.append(
+                f"{column_sql} AS {self._quote_alias(name)}"
+            )
+            group_parts.append(column_sql)
+
+        effective_aggregations: dict[str, str] = {}
+        for name, item in selected_indicators:
+            aggregation = requested_aggregations.get(
+                name, item["default_aggregation"]
+            )
+            if aggregation not in item["allowed_aggregations"]:
+                raise CatalogError(
+                    f"Aggregation {aggregation} is not allowed for "
+                    f"indicator {name}."
+                )
+            effective_aggregations[name] = aggregation
+            expression = self._aggregate_sql(
+                aggregation,
+                self._quote_identifier(item["column"]),
+            )
+            select_parts.append(
+                f"{expression} AS {self._quote_alias(name)}"
+            )
+
+        sql_parts = [
+            f"SELECT {', '.join(select_parts)}",
+            f"FROM {self._quote_identifier(definition['table'])}",
+        ]
+        if group_parts:
+            sql_parts.append(f"GROUP BY {', '.join(group_parts)}")
+            sql_parts.append(f"ORDER BY {', '.join(group_parts)}")
+        sql_parts.append("LIMIT ?")
+        sql = "\n".join(sql_parts)
+
+        database_value = definition["connection"]["database"]
+        database_path = Path(database_value)
+        if not database_path.is_absolute():
+            database_path = self.base_dir / database_path
+        database_path = database_path.resolve()
+        if not database_path.is_file():
+            raise CatalogError(
+                f"SQLite database does not exist for {datasource_name}."
+            )
+        uri = f"{database_path.as_uri()}?mode=ro"
+        try:
+            with sqlite3.connect(uri, uri=True) as connection:
+                connection.row_factory = sqlite3.Row
+                cursor = connection.execute(sql, (limit,))
+                raw_rows = [dict(row) for row in cursor.fetchall()]
+        except sqlite3.Error as exc:
+            raise CatalogError(
+                f"Query execution failed for {datasource_name}: {exc}"
+            ) from exc
+        rows = json.loads(
+            json.dumps(raw_rows, ensure_ascii=False, default=str)
+        )
+        return {
+            "datasource": datasource_name,
+            "dimensions": [name for name, _ in selected_dimensions],
+            "indicators": [name for name, _ in selected_indicators],
+            "aggregations": effective_aggregations,
+            "sql": sql,
+            "parameters": [limit],
+            "row_count": len(rows),
+            "rows": rows,
+        }
 
 
 @dataclass
@@ -240,6 +606,29 @@ class CatalogIndex:
             "warnings": item.get("warnings", []),
         }
 
+    def get_metric_contract(
+        self,
+        workbook: str,
+        metric: str,
+    ) -> dict[str, Any]:
+        workbook_item = self._workbook(workbook)
+        matches = [
+            item
+            for item in workbook_item.get("metric_contracts", [])
+            if str(item.get("metric", "")).casefold() == metric.casefold()
+            or str(item.get("internal_name", "")).casefold()
+            == metric.casefold()
+        ]
+        if len(matches) != 1:
+            raise CatalogError(
+                f"Metric contract not found in "
+                f"{workbook_item['workbook']}: {metric}"
+            )
+        return {
+            "workbook": workbook_item["workbook"],
+            **matches[0],
+        }
+
     def trace_dependencies(
         self,
         workbook: str,
@@ -310,6 +699,14 @@ def build_argument_parser() -> argparse.ArgumentParser:
         help="directory containing <Workbook>.json catalogs",
     )
     parser.add_argument(
+        "--semantic-config",
+        type=Path,
+        help=(
+            "JSON configuration for validated dimensions, indicators, "
+            "aggregation policies, and SQL access"
+        ),
+    )
+    parser.add_argument(
         "--check",
         action="store_true",
         help="validate catalogs and print a summary without starting MCP",
@@ -317,7 +714,10 @@ def build_argument_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def create_mcp_server(catalog: CatalogIndex) -> Any:
+def create_mcp_server(
+    catalog: CatalogIndex,
+    semantic_queries: SemanticQueryService | None = None,
+) -> Any:
     try:
         from mcp.server.fastmcp import FastMCP
     except ImportError as exc:
@@ -330,10 +730,19 @@ def create_mcp_server(catalog: CatalogIndex) -> Any:
         "Tableau Reverse-Engineering Catalog",
         instructions=(
             "Read-only access to Tableau calculated fields, worksheet filters, "
-            "dependency lineage, and change impact. Prefer search_catalog before "
-            "requesting details when workbook or field names are uncertain."
+            "dependency lineage, change impact, and configured semantic data. "
+            "Use get_dimensions and get_indicators before get_data. Prefer "
+            "search_catalog before requesting Tableau details when workbook or "
+            "field names are uncertain."
         ),
     )
+
+    def require_semantic_queries() -> SemanticQueryService:
+        if semantic_queries is None:
+            raise CatalogError(
+                "Semantic query tools require --semantic-config."
+            )
+        return semantic_queries
 
     @server.tool()
     def search_catalog(
@@ -367,6 +776,41 @@ def create_mcp_server(catalog: CatalogIndex) -> Any:
         return catalog.get_worksheet(workbook, worksheet)
 
     @server.tool()
+    def get_metric_contract(
+        workbook: str,
+        metric: str,
+    ) -> dict[str, Any]:
+        """Get the semantic recipe and Tableau contexts for one metric."""
+        return catalog.get_metric_contract(workbook, metric)
+
+    @server.tool()
+    def get_dimensions(datasource: str) -> dict[str, Any]:
+        """List configured dimensions with descriptions for one datasource."""
+        return require_semantic_queries().get_dimensions(datasource)
+
+    @server.tool()
+    def get_indicators(datasource: str) -> dict[str, Any]:
+        """List indicators with descriptions and aggregation policies."""
+        return require_semantic_queries().get_indicators(datasource)
+
+    @server.tool()
+    def get_data(
+        datasource: str,
+        dimensions: list[str],
+        indicators: list[str],
+        aggregations: dict[str, str] | None = None,
+        limit: int = 100,
+    ) -> dict[str, Any]:
+        """Run a bounded query compiled only from validated semantic inputs."""
+        return require_semantic_queries().get_data(
+            datasource,
+            dimensions=dimensions,
+            indicators=indicators,
+            aggregations=aggregations,
+            limit=limit,
+        )
+
+    @server.tool()
     def trace_dependencies(
         workbook: str,
         field: str,
@@ -386,10 +830,22 @@ def create_mcp_server(catalog: CatalogIndex) -> Any:
 
 def run(args: argparse.Namespace) -> int:
     catalog = CatalogIndex.load(args.catalog)
+    semantic_queries = (
+        SemanticQueryService.from_file(args.semantic_config)
+        if args.semantic_config
+        else None
+    )
     if args.check:
-        print(json.dumps(catalog.summary(), ensure_ascii=False, indent=2))
+        summary = catalog.summary()
+        summary["semantic_configured"] = semantic_queries is not None
+        summary["semantic_datasources"] = (
+            len(semantic_queries.config["datasources"])
+            if semantic_queries
+            else 0
+        )
+        print(json.dumps(summary, ensure_ascii=False, indent=2))
         return 0
-    server = create_mcp_server(catalog)
+    server = create_mcp_server(catalog, semantic_queries)
     server.run(transport="stdio")
     return 0
 

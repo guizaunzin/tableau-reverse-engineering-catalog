@@ -4,3 +4,4 @@ __pycache__/
 docs/
 /examples/
 /tests/
+semantic_config.json

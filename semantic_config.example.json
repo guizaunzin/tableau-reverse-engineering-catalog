@@ -1,0 +1,42 @@
+{
+  "version": 1,
+  "datasources": {
+    "Commercial Metrics": {
+      "description": "Approved semantic source for commercial reporting.",
+      "table": "commercial_metrics",
+      "connection": {
+        "driver": "sqlite",
+        "database": "data/commercial_metrics.db"
+      },
+      "dimensions": {
+        "Order Date": {
+          "column": "order_date",
+          "description": "Calendar date when the order was created."
+        },
+        "Region": {
+          "column": "region",
+          "description": "Approved commercial reporting region."
+        }
+      },
+      "indicators": {
+        "Orders": {
+          "column": "order_id",
+          "description": "Number of distinct orders.",
+          "default_aggregation": "count_distinct",
+          "allowed_aggregations": [
+            "count_distinct"
+          ]
+        },
+        "Revenue": {
+          "column": "revenue",
+          "description": "Gross recognized revenue before deductions.",
+          "default_aggregation": "sum",
+          "allowed_aggregations": [
+            "sum",
+            "avg"
+          ]
+        }
+      }
+    }
+  }
+}

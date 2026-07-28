@@ -11,6 +11,8 @@ navigable Markdown catalog focused on:
 - worksheets affected directly or indirectly by a field change.
 
 It uses only the Python standard library and never connects to Tableau Server.
+For the MCP architecture, secure semantic query layer, workplace rollout, and
+presentation guidance, see [MCP_SERVER.md](MCP_SERVER.md).
 
 ## Quick start
 
@@ -90,6 +92,27 @@ names such as `[Calculation_1001]` with visible captions such as
 `[Profit Ratio]` when the mapping is unambiguous. Unknown or ambiguous
 references are preserved and reported instead of guessed.
 
+## Metric contracts
+
+With `--emit-json`, each workbook includes additive `metric_contracts` designed
+to give LLMs a machine-readable starting point for reproducing Tableau metric
+logic. Each contract records:
+
+- the visible and internal datasource names;
+- the raw Tableau formula and resolved dependencies;
+- the calculation scope, such as aggregate, row-level, LOD, or table
+  calculation;
+- worksheet and Dashboard contexts;
+- detected shelf aggregations, approximate dimensional grain, and worksheet
+  filters;
+- an explicit semantic status, limitations, and extraction warnings.
+
+Metric contracts are semantic evidence, not validated SQL. They remain
+`partial` until the physical data model, relationships, Tableau order of
+operations, a target SQL dialect, and result-level validation are available.
+Existing workbook, worksheet, and field keys remain available for consumers of
+the earlier JSON format.
+
 ## Cross-workbook impact
 
 Fields are linked across workbooks only when both workbooks expose the same
@@ -103,8 +126,8 @@ field name. Matching captions alone are never considered sufficient.
 - Unsafe ZIP paths and embedded TWB files larger than 50 MiB are rejected.
 - Connection details and credentials are not extracted or documented.
 - Only worksheet filters are analyzed.
-- Dashboard actions, layout, joins, datasource documentation, SQL generation,
-  Parquet data, LLM calls, and MCP serving are outside V1.
+- Dashboard actions, layout, joins, executable SQL generation, result
+  validation, Parquet data, and LLM calls are not yet implemented.
 - Tableau XML varies by release. Unsupported references remain visible as
   warnings so they can become regression fixtures for later improvements.
 
@@ -130,23 +153,36 @@ python3 tableau_doc.py path/to/workbooks --output docs --emit-json
 The catalog loader and validation command use only the standard library:
 
 ```bash
-python3 tableau_mcp.py --catalog docs --check
+python3 tableau_mcp.py \
+  --catalog docs \
+  --semantic-config semantic_config.json \
+  --check
 ```
 
 Starting the MCP server requires the optional official Python SDK:
 
 ```bash
 pip install -r requirements-mcp.txt
-python3 tableau_mcp.py --catalog docs
+python3 tableau_mcp.py \
+  --catalog docs \
+  --semantic-config semantic_config.json
 ```
 
-The server uses stdio and exposes four bounded, read-only tools:
+The server uses stdio and exposes eight bounded, read-only tools:
 
 - `search_catalog`: search workbooks, worksheets, and fields;
 - `get_field_impact`: retrieve direct, indirect, and cross-workbook impact;
+- `get_metric_contract`: retrieve a metric's semantic recipe and Tableau
+  contexts;
+- `get_dimensions`: list configured dimensions with descriptions;
+- `get_indicators`: list indicators with descriptions and aggregation policies;
+- `get_data`: execute a bounded query compiled from validated semantic inputs;
 - `get_worksheet`: retrieve filters, calculations, and direct fields;
 - `trace_dependencies`: trace upstream or downstream lineage with a depth cap.
 
-No MCP tool reads TWB/TWBX files, queries Tableau Server, accesses business
-data, or modifies the catalog. Copy `mcp_config.example.json` and replace the
-placeholder paths with absolute local paths for the target MCP client.
+No MCP tool reads TWB/TWBX files, queries Tableau Server, or modifies the
+catalog. `get_data` can read only the datasource configured in
+`semantic_config.json`; the initial adapter opens SQLite in read-only mode and
+returns at most 1,000 rows. Copy `mcp_config.example.json` and replace the
+placeholder paths with absolute local paths for the target MCP client. See
+[MCP_SERVER.md](MCP_SERVER.md) for the security model and rollout guide.

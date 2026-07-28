@@ -5,7 +5,9 @@
       "args": [
         "/absolute/path/to/tableau_mcp.py",
         "--catalog",
-        "/absolute/path/to/generated/docs"
+        "/absolute/path/to/generated/docs",
+        "--semantic-config",
+        "/absolute/path/to/semantic_config.json"
       ]
     }
   }
