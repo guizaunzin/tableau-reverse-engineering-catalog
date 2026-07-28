@@ -1,102 +1,103 @@
-# MCP Server: guia de implementação e adoção
+# MCP Server: Implementation and Adoption Guide
 
-## Resumo executivo
+## Executive summary
 
-O MCP Server transforma duas fontes controladas em ferramentas que um LLM pode
-consultar:
+The MCP server turns two controlled sources into tools that an LLM can query:
 
-1. o catálogo extraído dos workbooks Tableau, que descreve fórmulas,
-   dependências, worksheets, Dashboards e Metric Contracts;
-2. uma configuração semântica aprovada, que mapeia nomes de negócio para
-   tabelas e colunas físicas, descrições e políticas de agregação.
+1. the catalog extracted from Tableau workbooks, which describes formulas,
+   dependencies, worksheets, dashboards, and metric contracts;
+2. an approved semantic configuration that maps business names to physical
+   tables and columns, descriptions, and aggregation policies.
 
-O objetivo não é permitir que o LLM escreva SQL livremente. O servidor só gera
-SQL depois de confirmar que datasource, dimensões, indicadores e agregações
-pertencem à configuração aprovada.
+The goal is not to let the LLM write unrestricted SQL. The server generates SQL
+only after confirming that the datasource, dimensions, indicators, and
+aggregations belong to the approved configuration.
 
-## O que foi construído
+## What has been built
 
-O servidor expõe oito ferramentas somente leitura:
+The server exposes eight read-only tools:
 
-| Ferramenta | Finalidade |
+| Tool | Purpose |
 |---|---|
-| `search_catalog` | Encontrar workbooks, worksheets e fields do Tableau. |
-| `get_field_impact` | Consultar dependências e impacto de um field. |
-| `get_worksheet` | Consultar filtros, cálculos e fields de uma worksheet. |
-| `get_metric_contract` | Obter a receita semântica extraída de uma métrica Tableau. |
-| `trace_dependencies` | Percorrer dependências upstream ou downstream. |
-| `get_dimensions` | Listar dimensões autorizadas com coluna e descrição. |
-| `get_indicators` | Listar indicadores, descrições e políticas de agregação. |
-| `get_data` | Validar uma solicitação, gerar SQL seguro e devolver resultados em JSON. |
+| `search_catalog` | Find Tableau workbooks, worksheets, and fields. |
+| `get_field_impact` | Inspect a field's dependencies and impact. |
+| `get_worksheet` | Inspect a worksheet's filters, calculations, and fields. |
+| `get_metric_contract` | Retrieve the semantic recipe extracted for a Tableau metric. |
+| `trace_dependencies` | Traverse upstream or downstream dependencies. |
+| `get_dimensions` | List authorized dimensions with physical columns and descriptions. |
+| `get_indicators` | List indicators, descriptions, and aggregation policies. |
+| `get_data` | Validate a request, generate safe SQL, and return JSON results. |
 
 ### `get_dimensions()`
 
-Recebe um datasource configurado e devolve as dimensões disponíveis, incluindo
-nome de negócio, coluna física e descrição.
+This tool receives a configured datasource and returns its available
+dimensions, including the business name, physical column, and description.
 
 ### `get_indicators()`
 
-Devolve indicadores, descrições, agregação padrão e agregações permitidas. Por
-exemplo, `Revenue` pode usar `sum` por padrão e permitir `avg`, enquanto
-`Orders` pode aceitar apenas `count_distinct`.
+This tool returns the indicators, their descriptions, default aggregation, and
+allowed aggregations. For example, `Revenue` may use `sum` by default while
+also allowing `avg`, whereas `Orders` may accept only `count_distinct`.
 
 ### `get_data()`
 
-Recebe datasource, dimensões, indicadores, overrides opcionais de agregação e
-um limite entre 1 e 1.000 linhas. O resultado contém SQL, parâmetros, políticas
-efetivamente usadas, quantidade de linhas e dados serializáveis em JSON.
+This tool receives a datasource, dimensions, indicators, optional aggregation
+overrides, and a limit between 1 and 1,000 rows. Its response contains the SQL,
+parameters, effective aggregation policies, row count, and JSON-serializable
+data.
 
-### Validação de inputs
+### Input validation
 
-Antes de abrir uma conexão, o servidor valida:
+Before opening a database connection, the server validates:
 
-- existência do datasource;
-- existência e ausência de duplicatas nas dimensões e indicadores;
-- máximo de 10 dimensões e 20 indicadores;
-- agregação solicitada contra a allowlist do indicador;
-- limite de linhas;
-- formato seguro dos identificadores definidos na configuração.
+- that the datasource exists;
+- that dimensions and indicators exist and contain no duplicates;
+- the maximum of 10 dimensions and 20 indicators;
+- each requested aggregation against the indicator's allowlist;
+- the result row limit;
+- the safe format of every identifier defined in the configuration.
 
-### Geração segura de SQL
+### Secure SQL generation
 
-O utilizador e o LLM nunca fornecem nomes físicos diretamente. Os nomes de
-negócio são resolvidos para identificadores previamente configurados. A geração:
+Users and LLMs never provide physical identifiers directly. Business names are
+resolved to identifiers that were approved in the configuration. SQL
+generation:
 
-- aceita somente identificadores validados;
-- aplica apenas `SUM`, `AVG`, `MIN`, `MAX`, `COUNT` e `COUNT DISTINCT`;
-- adiciona `GROUP BY` para as dimensões selecionadas;
-- usa `LIMIT ?` parametrizado;
-- abre SQLite com `mode=ro`;
-- não aceita fragmentos SQL, expressões, cláusulas ou filtros livres.
+- accepts only validated identifiers;
+- applies only `SUM`, `AVG`, `MIN`, `MAX`, `COUNT`, and `COUNT DISTINCT`;
+- adds `GROUP BY` for the selected dimensions;
+- uses a parameterized `LIMIT ?`;
+- opens SQLite with `mode=ro`;
+- does not accept free-form SQL fragments, expressions, clauses, or filters.
 
-Uma entrada como `Region; DROP TABLE sales` não corresponde a uma dimensão
-configurada e é rejeitada antes da execução.
+An input such as `Region; DROP TABLE sales` does not match a configured
+dimension and is rejected before execution.
 
-## Como as peças se relacionam
+## How the components fit together
 
 ```text
 TWB/TWBX
    │
    ▼
-tableau_doc.py ──► catálogo JSON ──► fórmulas, linhagem e Metric Contracts
+tableau_doc.py ──► JSON catalog ──► formulas, lineage, and metric contracts
                                            │
-semantic_config.json ──► nomes aprovados ──┤
+semantic_config.json ──► approved names ───┤
                                            ▼
                                     tableau_mcp.py
                                       │         │
-                                      │         └─► get_data() ──► SQLite read-only
-                                      └─► ferramentas de documentação
+                                      │         └─► get_data() ──► read-only SQLite
+                                      └─► documentation tools
 ```
 
-O catálogo responde “como o Tableau define e usa esta métrica?”. A configuração
-semântica responde “onde estão os dados físicos aprovados e quais operações são
-permitidas?”. As duas partes são complementares, mas ainda não são reconciliadas
-automaticamente.
+The catalog answers, "How does Tableau define and use this metric?" The
+semantic configuration answers, "Where are the approved physical data and
+which operations are allowed?" The two parts are complementary, but they are
+not yet reconciled automatically.
 
-## Configuração semântica
+## Semantic configuration
 
-Copie `semantic_config.example.json` para `semantic_config.json`. Não coloque
-senhas, tokens ou credenciais nesse ficheiro.
+Copy `semantic_config.example.json` to `semantic_config.json`. Do not place
+passwords, tokens, or credentials in this file.
 
 ```json
 {
@@ -128,18 +129,19 @@ senhas, tokens ou credenciais nesse ficheiro.
 }
 ```
 
-Os nomes `Region` e `Revenue` são o contrato apresentado ao LLM. `column` e
-`table` são identificadores físicos controlados pela equipa.
+Names such as `Region` and `Revenue` form the contract presented to the LLM.
+The `column` and `table` values are physical identifiers controlled by the
+data team.
 
-## Como executar localmente
+## Running locally
 
-Gere primeiro o catálogo:
+Generate the catalog first:
 
 ```bash
 python3 tableau_doc.py /path/to/workbooks --output docs --emit-json
 ```
 
-Instale o SDK opcional:
+Install the optional SDK:
 
 ```bash
 python3 -m venv .venv-mcp
@@ -147,7 +149,7 @@ source .venv-mcp/bin/activate
 pip install -r requirements-mcp.txt
 ```
 
-Valide catálogo e configuração sem iniciar o servidor:
+Validate the catalog and configuration without starting the server:
 
 ```bash
 python3 tableau_mcp.py \
@@ -156,7 +158,7 @@ python3 tableau_mcp.py \
   --check
 ```
 
-Inicie o servidor:
+Start the server:
 
 ```bash
 python3 tableau_mcp.py \
@@ -164,92 +166,96 @@ python3 tableau_mcp.py \
   --semantic-config semantic_config.json
 ```
 
-Para um cliente MCP, copie `mcp_config.example.json`, use caminhos absolutos e
-reinicie o cliente.
+To configure an MCP client, copy `mcp_config.example.json`, replace the
+placeholders with absolute paths, and restart the client.
 
-## Fluxo esperado para o LLM
+## Expected LLM workflow
 
-Para responder “qual foi a receita por região?”:
+To answer "What was revenue by region?":
 
-1. chamar `get_metric_contract` para entender a definição Tableau de
+1. call `get_metric_contract` to understand Tableau's definition of
    `Revenue`;
-2. chamar `get_dimensions` para confirmar que `Region` está disponível;
-3. chamar `get_indicators` para confirmar `Revenue` e sua agregação padrão;
-4. chamar `get_data` com `dimensions=["Region"]` e
+2. call `get_dimensions` to confirm that `Region` is available;
+3. call `get_indicators` to confirm `Revenue` and its default aggregation;
+4. call `get_data` with `dimensions=["Region"]` and
    `indicators=["Revenue"]`;
-5. explicar o resultado junto com o contrato e as limitações conhecidas.
+5. explain the result together with the metric contract and known
+   limitations.
 
-O LLM não deve saltar diretamente para `get_data` inventando campos.
+The LLM should not skip directly to `get_data` and invent field names.
 
-## O que fazer em seguida no trabalho
+## Recommended next steps at work
 
-### 1. Escolher um piloto pequeno
+### 1. Select a small pilot
 
-Escolha um Dashboard importante com duas ou três métricas e números de
-referência conhecidos no Tableau.
+Choose an important dashboard with two or three metrics and known Tableau
+reference values.
 
-### 2. Definir owners
+### 2. Define owners
 
-Para cada métrica, identifique owner de negócio, owner dos dados, datasource e
-tabela aprovados, definição, agregação padrão, exceções e dimensões autorizadas.
+For each metric, identify its business owner, data owner, approved datasource
+and table, definition, default aggregation, exceptions, and authorized
+dimensions.
 
-### 3. Preencher a configuração
+### 3. Populate the configuration
 
-Mapeie apenas os campos aprovados. Uma allowlist pequena torna o comportamento
-mais seguro e mais fácil de validar.
+Map only approved fields. A small allowlist makes the behavior safer and
+easier to validate.
 
-### 4. Validar contra o Tableau
+### 4. Validate against Tableau
 
-Compare queries por combinações conhecidas de data e dimensão. Registre valor
-Tableau, valor MCP, filtros, diferença, causa e aprovação do owner. Uma métrica
-só deve ser apresentada como equivalente após essa validação.
+Compare queries across known date and dimension combinations. Record the
+Tableau value, MCP value, filters, difference, root cause, and owner approval.
+A metric should be presented as equivalent only after this validation.
 
-### 5. Escolher o adapter corporativo
+### 5. Select the corporate adapter
 
-O executor atual suporta SQLite somente leitura. Para produção, a equipa deve
-escolher Snowflake, BigQuery, SQL Server ou outro warehouse. O adapter deverá:
+The current executor supports read-only SQLite. For production, the team should
+select Snowflake, BigQuery, SQL Server, or another warehouse. The adapter
+should:
 
-- usar credenciais geridas fora da configuração;
-- executar com role somente leitura;
-- aplicar timeout, limite de custo e limite de linhas;
-- manter a mesma validação e o mesmo compilador restrito;
-- registrar auditoria sem guardar dados sensíveis.
+- use credentials managed outside the configuration;
+- execute with a read-only role;
+- apply timeouts, cost controls, and row limits;
+- retain the same validation and restricted compiler;
+- record audit events without storing sensitive results.
 
-### 6. Fazer um piloto com utilizadores
+### 6. Run a user pilot
 
-Teste se o LLM escolhe a métrica correta, usa a agregação padrão, pergunta
-quando falta contexto, cita limitações e reproduz os valores validados.
+Test whether the LLM selects the correct metric, uses the default aggregation,
+asks for missing context, states limitations, and reproduces validated values.
 
-## Como apresentar ao seu chefe
+## How to present this to your manager
 
-Uma narrativa curta:
+A concise narrative:
 
-> Hoje as pessoas tratam o Tableau como golden source, mas o LLM não conhece as
-> regras que produziram aqueles números. Construímos uma camada que extrai a
-> definição das métricas do Tableau e expõe apenas dimensões, indicadores e
-> agregações aprovadas. O LLM não escreve SQL livre: ele solicita conceitos de
-> negócio, o servidor valida esses conceitos e gera uma query limitada e
-> somente leitura. O próximo passo é validar um pequeno grupo de métricas contra
-> um Dashboard real e conectar o mecanismo ao nosso warehouse corporativo.
+> People currently treat Tableau as a golden source, but an LLM does not know
+> the rules that produced those numbers. We built a layer that extracts metric
+> definitions from Tableau and exposes only approved dimensions, indicators,
+> and aggregations. The LLM does not write unrestricted SQL: it requests
+> business concepts, the server validates those concepts, and then generates a
+> bounded, read-only query. The next step is to validate a small set of metrics
+> against a real dashboard and connect the same mechanism to our corporate
+> warehouse.
 
-Para uma demonstração:
+For a demonstration:
 
-1. mostre `get_metric_contract("Revenue")`;
-2. mostre `get_indicators()` e a política `sum`;
-3. tente uma dimensão inválida e mostre a rejeição;
-4. execute uma consulta válida por `Region`;
-5. compare o resultado com um valor conhecido do Tableau.
+1. show `get_metric_contract("Revenue")`;
+2. show `get_indicators()` and the `sum` policy;
+3. try an invalid dimension and show the rejection;
+4. execute a valid query grouped by `Region`;
+5. compare the result with a known Tableau value.
 
-## Estado atual e limitações
+## Current state and limitations
 
-- Metric Contracts não capturam ainda todo o modelo físico, joins ou a ordem
-  completa de operações do Tableau.
-- O executor suporta SQLite somente leitura.
-- Não existem filtros livres em `get_data`; isso é intencional no primeiro
-  núcleo seguro.
-- Não há ainda autenticação corporativa, auditoria persistente, timeout ou
-  controlo de custo.
-- A equivalência com o Tableau precisa ser validada métrica por métrica.
+- Metric contracts do not yet capture the complete physical model, joins, or
+  Tableau's full order of operations.
+- The executor currently supports read-only SQLite.
+- `get_data` does not accept free-form filters; this is intentional in the
+  first secure implementation.
+- Corporate authentication, persistent audit logging, timeouts, and cost
+  controls are not yet implemented.
+- Equivalence with Tableau must be validated one metric at a time.
 
-Esses pontos não impedem um piloto. Eles definem a diferença entre um protótipo
-controlado e um serviço de produção.
+These limitations do not prevent a controlled pilot. They clearly define the
+difference between a prototype and a production service.
