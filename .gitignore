@@ -3,6 +3,13 @@ __pycache__/
 .DS_Store
 docs/
 /examples/
-/tests/
+/tests/*
+!/tests/test_analytics_core.py
 semantic_config.json
 semantic_config.draft.json
+/.venv-analytics/
+/data/
+/analytics_config.json
+/request.json
+/validation_cases.json
+/analytics_results/

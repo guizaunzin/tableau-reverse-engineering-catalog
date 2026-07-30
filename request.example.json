@@ -1,0 +1,12 @@
+{
+  "metric": "orders",
+  "dimensions": [
+    "source"
+  ],
+  "filters": [],
+  "sort": {
+    "field": "orders",
+    "direction": "desc"
+  },
+  "limit": 10
+}

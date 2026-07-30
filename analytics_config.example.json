@@ -1,0 +1,59 @@
+{
+  "version": 1,
+  "dataset": "sample_orders",
+  "tableau": {
+    "workbook": "overview_dashboard_viz_extensions",
+    "worksheet": "donut"
+  },
+  "source": {
+    "path": "data/sample_orders.parquet"
+  },
+  "dimensions": {
+    "source": {
+      "column": "Source",
+      "type": "string"
+    }
+  },
+  "filter_fields": {
+    "source": {
+      "column": "Source",
+      "type": "string",
+      "operators": [
+        "eq",
+        "in",
+        "is_null",
+        "is_not_null"
+      ]
+    },
+    "order_date": {
+      "column": "Order Date",
+      "type": "date",
+      "operators": [
+        "eq",
+        "gte",
+        "lte"
+      ]
+    },
+    "business_status": {
+      "column": "Business Status",
+      "type": "string",
+      "operators": [
+        "eq",
+        "in"
+      ]
+    }
+  },
+  "metrics": {
+    "orders": {
+      "column": "Order ID",
+      "aggregation": "count_distinct"
+    }
+  },
+  "default_filters": [
+    {
+      "field": "business_status",
+      "operator": "eq",
+      "value": "VALID"
+    }
+  ]
+}
