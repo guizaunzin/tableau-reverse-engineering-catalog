@@ -1,0 +1,129 @@
+{
+  "cases": [
+    {
+      "name": "orders_by_source",
+      "request": {
+        "metric": "orders",
+        "dimensions": [
+          "source"
+        ],
+        "filters": [],
+        "sort": {
+          "field": "orders",
+          "direction": "desc"
+        },
+        "limit": 10
+      },
+      "expected_rows": [
+        {
+          "source": "Online",
+          "orders": 2
+        },
+        {
+          "source": "Retail",
+          "orders": 2
+        },
+        {
+          "source": "Partner",
+          "orders": 1
+        }
+      ]
+    },
+    {
+      "name": "online_orders",
+      "request": {
+        "metric": "orders",
+        "dimensions": [
+          "source"
+        ],
+        "filters": [
+          {
+            "field": "source",
+            "operator": "eq",
+            "value": "Online"
+          }
+        ],
+        "sort": {
+          "field": "orders",
+          "direction": "desc"
+        },
+        "limit": 10
+      },
+      "expected_rows": [
+        {
+          "source": "Online",
+          "orders": 2
+        }
+      ]
+    },
+    {
+      "name": "top_source",
+      "request": {
+        "metric": "orders",
+        "dimensions": [
+          "source"
+        ],
+        "filters": [],
+        "sort": {
+          "field": "orders",
+          "direction": "desc"
+        },
+        "limit": 1
+      },
+      "expected_rows": [
+        {
+          "source": "Online",
+          "orders": 2
+        }
+      ]
+    },
+    {
+      "name": "total_orders",
+      "request": {
+        "metric": "orders",
+        "dimensions": [],
+        "filters": [],
+        "limit": 10
+      },
+      "expected_rows": [
+        {
+          "orders": 5
+        }
+      ]
+    },
+    {
+      "name": "selected_sources",
+      "request": {
+        "metric": "orders",
+        "dimensions": [
+          "source"
+        ],
+        "filters": [
+          {
+            "field": "source",
+            "operator": "in",
+            "value": [
+              "Online",
+              "Partner"
+            ]
+          }
+        ],
+        "sort": {
+          "field": "orders",
+          "direction": "desc"
+        },
+        "limit": 10
+      },
+      "expected_rows": [
+        {
+          "source": "Online",
+          "orders": 2
+        },
+        {
+          "source": "Partner",
+          "orders": 1
+        }
+      ]
+    }
+  ]
+}

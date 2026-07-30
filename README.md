@@ -10,7 +10,17 @@ navigable Markdown catalog focused on:
 - reverse field impact analysis;
 - worksheets affected directly or indirectly by a field change.
 
-It uses only the Python standard library and never connects to Tableau Server.
+## Analytics MVP: DuckDB over Parquet
+
+The current MVP adds a small deterministic analytics core. It maps approved
+business names to Parquet columns, builds controlled SQL, executes it with
+DuckDB, and compares results with saved Tableau reference cases.
+
+Start with [ANALYTICS_MVP_GUIDE.md](ANALYTICS_MVP_GUIDE.md). The MCP server is
+kept as prior work but is not required for this MVP.
+
+The Tableau extractor uses only the Python standard library and never connects
+to Tableau Server.
 For the MCP architecture, secure semantic query layer, workplace rollout, and
 presentation guidance, see [MCP_SERVER.md](MCP_SERVER.md).
 
