@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate a small reverse-engineering catalog from Tableau workbooks.
+"""Extract and normalize semantic metadata from Tableau workbooks.
 
 The implementation intentionally uses only the Python standard library.  It
 reads workbook metadata, not extracts or the data referenced by a workbook.
@@ -13,21 +13,19 @@ import json
 import re
 import sys
 import zipfile
-from collections import defaultdict, deque
+from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Iterable
-from urllib.parse import quote
 from xml.etree import ElementTree as ET
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 MAX_TWB_BYTES = 50 * 1024 * 1024
 FIELD_REFERENCE_RE = re.compile(
     r"(?:\[[^\]\r\n]+\]\.)?\[[^\]\r\n]+\]"
 )
 SAFE_SLUG_RE = re.compile(r"[^a-z0-9]+")
-INVALID_FILENAME_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f]+')
 AGGREGATE_FUNCTIONS = {
     "AVG",
     "COUNT",
@@ -153,63 +151,6 @@ def local_name(tag: str) -> str:
 def slugify(value: str, fallback: str = "item") -> str:
     slug = SAFE_SLUG_RE.sub("-", value.casefold()).strip("-")
     return slug or fallback
-
-
-def workbook_filename_stem(value: str) -> str:
-    """Create a readable workbook filename stem portable across platforms."""
-    filename = INVALID_FILENAME_RE.sub("-", value).strip().rstrip(". ")
-    if not filename:
-        filename = "Workbook"
-    if filename.casefold() in {
-        "aux",
-        "com1",
-        "com2",
-        "com3",
-        "com4",
-        "com5",
-        "com6",
-        "com7",
-        "com8",
-        "com9",
-        "con",
-        "lpt1",
-        "lpt2",
-        "lpt3",
-        "lpt4",
-        "lpt5",
-        "lpt6",
-        "lpt7",
-        "lpt8",
-        "lpt9",
-        "nul",
-        "prn",
-    }:
-        filename = f"_{filename}"
-    return filename[:160]
-
-
-def workbook_markdown_filename(value: str) -> str:
-    return f"{workbook_filename_stem(value)}.md"
-
-
-def worksheets_markdown_filename(value: str) -> str:
-    return f"{workbook_filename_stem(value)} - Worksheets.md"
-
-
-def field_impact_markdown_filename(value: str) -> str:
-    return f"{workbook_filename_stem(value)} - Field Impact.md"
-
-
-def workbook_json_filename(value: str) -> str:
-    return f"{workbook_filename_stem(value)}.json"
-
-
-def markdown_escape(value: object) -> str:
-    return str(value).replace("\\", "\\\\").replace("|", "\\|").replace("\n", " ")
-
-
-def mermaid_escape(value: str) -> str:
-    return value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", " ")
 
 
 def unbracket(value: str) -> str:
@@ -657,18 +598,6 @@ def relevant_fields(workbook: Workbook) -> set[str]:
     )
 
 
-def reverse_dependencies(
-    fields: dict[str, Field],
-    included: set[str],
-) -> dict[str, set[str]]:
-    reverse: dict[str, set[str]] = defaultdict(set)
-    for key in included:
-        for dependency in fields[key].dependencies:
-            if dependency in included:
-                reverse[dependency].add(key)
-    return reverse
-
-
 def detect_cycles(workbook: Workbook, included: set[str]) -> None:
     """Record relevant calculated-field dependency cycles."""
     state: dict[str, int] = {}
@@ -705,84 +634,6 @@ def detect_cycles(workbook: Workbook, included: set[str]) -> None:
             visit(key)
 
 
-def shortest_impact_path(
-    start: str,
-    worksheet: Worksheet,
-    reverse: dict[str, set[str]],
-) -> list[str] | None:
-    if start in worksheet.direct_fields:
-        return [start]
-    queue: deque[list[str]] = deque([[start]])
-    visited = {start}
-    while queue:
-        path = queue.popleft()
-        for dependent in sorted(reverse.get(path[-1], set())):
-            if dependent in visited:
-                continue
-            new_path = [*path, dependent]
-            if dependent in worksheet.direct_fields:
-                return new_path
-            visited.add(dependent)
-            queue.append(new_path)
-    return None
-
-
-def build_cross_workbook_impacts(
-    workbooks: list[Workbook],
-) -> dict[tuple[int, str], list[dict[str, object]]]:
-    """Match fields across workbooks only with a stable published identity."""
-    groups: dict[tuple[str, str], list[tuple[int, Workbook, str]]] = defaultdict(list)
-    workbook_models: dict[int, tuple[set[str], dict[str, set[str]]]] = {}
-    for index, workbook in enumerate(workbooks):
-        included = relevant_fields(workbook)
-        reverse = reverse_dependencies(workbook.fields, included)
-        workbook_models[index] = (included, reverse)
-        for key in included:
-            item = workbook.fields[key]
-            if item.datasource_identity:
-                groups[
-                    (item.datasource_identity, item.internal_name.casefold())
-                ].append((index, workbook, key))
-
-    result: dict[tuple[int, str], list[dict[str, object]]] = defaultdict(list)
-    for occurrences in groups.values():
-        if len({index for index, _, _ in occurrences}) < 2:
-            continue
-        for source_index, _, source_key in occurrences:
-            for target_index, target_workbook, target_key in occurrences:
-                if source_index == target_index:
-                    continue
-                _, target_reverse = workbook_models[target_index]
-                for worksheet in sorted(
-                    target_workbook.worksheets,
-                    key=lambda value: value.name.casefold(),
-                ):
-                    path = shortest_impact_path(
-                        target_key, worksheet, target_reverse
-                    )
-                    if path is None:
-                        continue
-                    result[(source_index, source_key)].append(
-                        {
-                            "workbook": target_workbook.name,
-                            "worksheet": worksheet.name,
-                            "impact": "direct" if len(path) == 1 else "indirect",
-                            "path": [
-                                target_workbook.fields[node].caption for node in path
-                            ],
-                        }
-                    )
-    for impacts in result.values():
-        impacts.sort(
-            key=lambda item: (
-                str(item["workbook"]).casefold(),
-                str(item["worksheet"]).casefold(),
-                tuple(str(part).casefold() for part in item["path"]),
-            )
-        )
-    return result
-
-
 def unique_slugs(labels: Iterable[tuple[str, str]]) -> dict[str, str]:
     """Return stable, collision-safe slugs keyed by entity key."""
     result: dict[str, str] = {}
@@ -801,266 +652,6 @@ def worksheet_relevant_fields(
     return dependency_closure(worksheet.direct_fields, fields)
 
 
-def render_mermaid(
-    edges: list[tuple[str, str]],
-    labels: dict[str, str],
-    max_nodes: int = 30,
-) -> tuple[list[str], bool]:
-    all_nodes = {node for edge in edges for node in edge}
-    truncated = len(all_nodes) > max_nodes
-    selected_edges = edges
-    if truncated:
-        selected_edges = edges[:max_nodes]
-        all_nodes = {node for edge in selected_edges for node in edge}
-    lines = ["```mermaid", "flowchart LR"]
-    node_ids = {
-        key: f"N{index}"
-        for index, key in enumerate(sorted(all_nodes), start=1)
-    }
-    for key in sorted(all_nodes):
-        lines.append(
-            f'    {node_ids[key]}["{mermaid_escape(labels.get(key, key))}"]'
-        )
-    for left, right in selected_edges:
-        if left in node_ids and right in node_ids:
-            lines.append(f"    {node_ids[left]} --> {node_ids[right]}")
-    lines.append("```")
-    return lines, truncated
-
-
-def worksheet_page(
-    workbook: Workbook,
-    worksheet: Worksheet,
-    field_slugs: dict[str, str],
-    field_impact_filename: str,
-) -> str:
-    included = worksheet_relevant_fields(worksheet, workbook.fields)
-    calculations = sorted(
-        (
-            workbook.fields[key]
-            for key in included
-            if workbook.fields[key].raw_formula is not None
-            and not workbook.fields[key].is_parameter
-        ),
-        key=lambda item: item.caption.casefold(),
-    )
-    worksheet_anchor = slugify(worksheet.name)
-    lines = [
-        f'<a id="{worksheet_anchor}"></a>',
-        "",
-        f"## {worksheet.name}",
-        "",
-        f"**Workbook:** {workbook.name}",
-        "",
-    ]
-    lines.extend(["### Filters", ""])
-    if worksheet.filters:
-        lines.extend(["| Field | Operator | Value |", "|---|---|---|"])
-        for item in worksheet.filters:
-            lines.append(
-                f"| {markdown_escape(item.field_label)} | "
-                f"{markdown_escape(item.operator)} | {markdown_escape(item.value)} |"
-            )
-    else:
-        lines.append("No worksheet filters detected.")
-    lines.extend(["", "### Calculated Fields", ""])
-    if not calculations:
-        lines.extend(["No relevant calculated fields detected.", ""])
-    for item in calculations:
-        usage = "Directly by this worksheet" if item.key in worksheet.direct_fields else "Supporting dependency"
-        lines.extend(
-            [
-                f"#### {item.caption}",
-                "",
-                "```tableau",
-                item.display_formula or "",
-                "```",
-                "",
-                "Depends on:",
-                "",
-            ]
-        )
-        if item.dependencies:
-            for dependency in item.dependencies:
-                target = workbook.fields[dependency]
-                lines.append(
-                    f"- [{target.caption}]"
-                    f"({quote(field_impact_filename)}#{field_slugs[dependency]})"
-                )
-        else:
-            lines.append("- None detected")
-        lines.extend(["", f"Used: {usage}", ""])
-    edges = [
-        (dependency, item.key)
-        for item in calculations
-        for dependency in item.dependencies
-        if dependency in included
-    ]
-    lines.extend(["### Dependency Graph", ""])
-    if edges:
-        graph, truncated = render_mermaid(
-            edges,
-            {key: workbook.fields[key].caption for key in included},
-        )
-        lines.extend(graph)
-        if truncated:
-            lines.extend(["", "> Graph reduced to keep it readable."])
-    else:
-        lines.append("No calculation dependency edges detected.")
-    notes = list(worksheet.warnings)
-    notes.extend(
-        warning
-        for key in included
-        for warning in workbook.fields[key].warnings
-        if warning not in notes
-    )
-    lines.extend(
-        [
-            "",
-            "### Extraction Notes",
-            "",
-            "- Worksheet filters only.",
-            "- Dashboard action filters were not analyzed.",
-        ]
-    )
-    for warning in notes:
-        lines.append(f"- Warning: {warning}")
-    return "\n".join(lines).rstrip() + "\n"
-
-
-def field_page(
-    workbook: Workbook,
-    key: str,
-    included: set[str],
-    reverse: dict[str, set[str]],
-    worksheet_slugs: dict[str, str],
-    field_slugs: dict[str, str],
-    cross_impacts: list[dict[str, object]],
-    worksheets_filename: str,
-) -> str:
-    item = workbook.fields[key]
-    direct_worksheets = sorted(
-        (sheet for sheet in workbook.worksheets if key in sheet.direct_fields),
-        key=lambda sheet: sheet.name.casefold(),
-    )
-    impacts: list[tuple[Worksheet, str, list[str]]] = []
-    for worksheet in sorted(workbook.worksheets, key=lambda sheet: sheet.name.casefold()):
-        path = shortest_impact_path(key, worksheet, reverse)
-        if path:
-            impacts.append(
-                (
-                    worksheet,
-                    "Direct" if len(path) == 1 else "Indirect",
-                    path,
-                )
-            )
-    dependent_calculations = sorted(
-        reverse.get(key, set()),
-        key=lambda dependency: workbook.fields[dependency].caption.casefold(),
-    )
-    lines = [
-        f'<a id="{field_slugs[key]}"></a>',
-        "",
-        f"## {item.caption}",
-        "",
-        f"**Type:** {item.field_type}  ",
-        f"**Datasource:** {item.datasource_caption}",
-        "",
-    ]
-    if item.raw_formula is not None and not item.is_parameter:
-        lines.extend(
-            [
-                "### Formula",
-                "",
-                "```tableau",
-                item.display_formula or "",
-                "```",
-                "",
-            ]
-        )
-    lines.extend(["### Direct Worksheet Usage", ""])
-    if direct_worksheets:
-        for worksheet in direct_worksheets:
-            lines.append(
-                f"- [{worksheet.name}]"
-                f"({quote(worksheets_filename)}#{worksheet_slugs[worksheet.name]})"
-            )
-    else:
-        lines.append("None.")
-    lines.extend(["", "### Dependent Calculations", ""])
-    if dependent_calculations:
-        for dependent in dependent_calculations:
-            target = workbook.fields[dependent]
-            lines.append(f"- [{target.caption}](#{field_slugs[dependent]})")
-    else:
-        lines.append("None.")
-    lines.extend(
-        [
-            "",
-            "### Impacted Worksheets",
-            "",
-            "| Worksheet | Impact | Dependency Path |",
-            "|---|---|---|",
-        ]
-    )
-    if impacts:
-        for worksheet, impact, path in impacts:
-            path_text = " → ".join(workbook.fields[node].caption for node in path)
-            lines.append(
-                f"| [{markdown_escape(worksheet.name)}]"
-                f"({quote(worksheets_filename)}#{worksheet_slugs[worksheet.name]}) | "
-                f"{impact} | {markdown_escape(path_text)} |"
-            )
-    else:
-        lines.append("| None | — | — |")
-    graph_edges: list[tuple[str, str]] = []
-    graph_labels = {field_key_: workbook.fields[field_key_].caption for field_key_ in included}
-    queue = deque([key])
-    seen = {key}
-    while queue:
-        current = queue.popleft()
-        for dependent in sorted(reverse.get(current, set())):
-            graph_edges.append((current, dependent))
-            if dependent not in seen:
-                seen.add(dependent)
-                queue.append(dependent)
-    for worksheet, _, path in impacts:
-        terminal = path[-1]
-        sheet_key = f"worksheet:{worksheet.name}"
-        graph_labels[sheet_key] = worksheet.name
-        graph_edges.append((terminal, sheet_key))
-    lines.extend(["", "### Reverse Dependency Graph", ""])
-    if graph_edges:
-        graph, truncated = render_mermaid(graph_edges, graph_labels)
-        lines.extend(graph)
-        if truncated:
-            lines.extend(["", "> Graph reduced to keep it readable."])
-    else:
-        lines.append("No reverse dependency edges detected.")
-    if cross_impacts:
-        lines.extend(
-            [
-                "",
-                "### Cross-Workbook Impact",
-                "",
-                "| Workbook | Worksheet | Impact | Dependency Path |",
-                "|---|---|---|---|",
-            ]
-        )
-        for impact in cross_impacts:
-            lines.append(
-                f"| {markdown_escape(impact['workbook'])} | "
-                f"{markdown_escape(impact['worksheet'])} | "
-                f"{markdown_escape(impact['impact']).title()} | "
-                f"{markdown_escape(' → '.join(impact['path']))} |"
-            )
-    if item.warnings:
-        lines.extend(["", "### Warnings", ""])
-        lines.extend(f"- {warning}" for warning in item.warnings)
-    lines.extend(["", "[↑ Back to top](#top)"])
-    return "\n".join(lines).rstrip() + "\n"
-
-
 def metric_calculation_scope(item: Field) -> str:
     classification = formula_classification(
         item.raw_formula, item.is_parameter
@@ -1076,452 +667,379 @@ def metric_calculation_scope(item: Field) -> str:
     return "base_measure"
 
 
-def metric_contracts(
-    workbook: Workbook,
-    included: set[str],
-    reverse: dict[str, set[str]],
-) -> list[dict[str, object]]:
-    dashboards_by_worksheet: dict[str, list[str]] = defaultdict(list)
-    for dashboard in workbook.dashboards:
-        for worksheet_name in dashboard.worksheets:
-            dashboards_by_worksheet[worksheet_name].append(dashboard.name)
-
-    contracts: list[dict[str, object]] = []
-    metric_keys = [
-        key
-        for key in included
-        if not workbook.fields[key].is_parameter
-        and (
-            (workbook.fields[key].role or "").casefold() == "measure"
-            or (
-                workbook.fields[key].raw_formula is not None
-                and (workbook.fields[key].role or "").casefold()
-                != "dimension"
-            )
-        )
-    ]
-    for key in sorted(
-        metric_keys,
-        key=lambda value: (
-            workbook.fields[value].datasource_caption.casefold(),
-            workbook.fields[value].caption.casefold(),
-        ),
-    ):
-        item = workbook.fields[key]
-        contexts: list[dict[str, object]] = []
-        for worksheet in sorted(
-            workbook.worksheets, key=lambda value: value.name.casefold()
-        ):
-            path = shortest_impact_path(key, worksheet, reverse)
-            if path is None:
-                continue
-            aggregations = sorted(
-                {
-                    usage.aggregation
-                    for usage in worksheet.field_usages
-                    if usage.field_key == key
-                    and usage.aggregation is not None
-                }
-            )
-            grain = sorted(
-                {
-                    workbook.fields[usage.field_key].caption
-                    for usage in worksheet.field_usages
-                    if usage.context
-                    in {"rows", "cols", "columns", "detail"}
-                    and usage.field_key in workbook.fields
-                    and (
-                        workbook.fields[usage.field_key].role or ""
-                    ).casefold()
-                    == "dimension"
-                },
-                key=str.casefold,
-            )
-            contexts.append(
-                {
-                    "worksheet": worksheet.name,
-                    "dashboards": dashboards_by_worksheet.get(
-                        worksheet.name, []
-                    ),
-                    "usage": "direct" if len(path) == 1 else "indirect",
-                    "aggregations": aggregations,
-                    "grain": grain,
-                    "filters": [
-                        {
-                            "field": filter_info.field_label,
-                            "operator": filter_info.operator,
-                            "value": filter_info.value,
-                        }
-                        for filter_info in worksheet.filters
-                    ],
-                }
-            )
-        contracts.append(
-            {
-                "metric": item.caption,
-                "internal_name": item.internal_name,
-                "datasource": item.datasource_caption,
-                "datasource_internal": item.datasource,
-                "field_type": item.field_type,
-                "formula_tableau": item.raw_formula,
-                "formula_display": item.display_formula,
-                "calculation_scope": metric_calculation_scope(item),
-                "dependencies": [
-                    workbook.fields[dependency].caption
-                    for dependency in item.dependencies
-                    if dependency in included
-                ],
-                "contexts": contexts,
-                "semantic_status": (
-                    "unresolved" if item.warnings else "partial"
-                ),
-                "limitations": [
-                    "physical_model_not_extracted",
-                    "relationships_and_joins_not_extracted",
-                    "tableau_order_of_operations_not_fully_modeled",
-                    "sql_dialect_not_selected",
-                ],
-                "warnings": item.warnings,
-            }
-        )
-    return contracts
-
-
-def workbook_payload(
-    workbook: Workbook,
-    included: set[str],
-    reverse: dict[str, set[str]],
-    cross_impacts: dict[str, list[dict[str, object]]],
+def _entity(
+    entity_id: str,
+    entity_type: str,
+    name: str,
+    source_id: str,
+    tableau_object_type: str,
+    tableau_name: str,
+    attributes: dict[str, object] | None = None,
 ) -> dict[str, object]:
-    worksheets_payload = []
-    for worksheet in sorted(workbook.worksheets, key=lambda item: item.name.casefold()):
-        worksheet_fields = worksheet_relevant_fields(worksheet, workbook.fields)
-        worksheets_payload.append(
-            {
-                "name": worksheet.name,
-                "direct_fields": sorted(
-                    (workbook.fields[key].caption for key in worksheet.direct_fields),
-                    key=str.casefold,
-                ),
-                "calculated_fields": sorted(
-                    (
-                        workbook.fields[key].caption
-                        for key in worksheet_fields
-                        if workbook.fields[key].raw_formula is not None
-                        and not workbook.fields[key].is_parameter
-                    ),
-                    key=str.casefold,
-                ),
-                "filters": [
-                    {
-                        "field": item.field_label,
-                        "operator": item.operator,
-                        "value": item.value,
-                    }
-                    for item in worksheet.filters
-                ],
-                "field_usages": [
-                    {
-                        "field": workbook.fields[usage.field_key].caption,
-                        "context": usage.context,
-                        "aggregation": usage.aggregation,
-                    }
-                    for usage in worksheet.field_usages
-                    if usage.field_key in workbook.fields
-                ],
-                "warnings": worksheet.warnings,
-            }
-        )
-    fields_payload = []
-    for key in sorted(included, key=lambda value: workbook.fields[value].caption.casefold()):
-        item = workbook.fields[key]
-        impacts = []
-        for worksheet in sorted(workbook.worksheets, key=lambda value: value.name.casefold()):
-            path = shortest_impact_path(key, worksheet, reverse)
-            if path:
-                impacts.append(
-                    {
-                        "worksheet": worksheet.name,
-                        "impact": "direct" if len(path) == 1 else "indirect",
-                        "path": [workbook.fields[node].caption for node in path],
-                    }
-                )
-        fields_payload.append(
-            {
-                "caption": item.caption,
-                "internal_name": item.internal_name,
-                "datasource": item.datasource,
-                "datasource_identity": item.datasource_identity,
-                "type": item.field_type,
-                "classification": formula_classification(
-                    item.raw_formula, item.is_parameter
-                ),
-                "raw_formula": item.raw_formula,
-                "display_formula": item.display_formula,
-                "dependencies": [
-                    workbook.fields[dependency].caption
-                    for dependency in item.dependencies
-                    if dependency in included
-                ],
-                "dependents": [
-                    workbook.fields[dependent].caption
-                    for dependent in sorted(
-                        reverse.get(key, set()),
-                        key=lambda value: workbook.fields[value].caption.casefold(),
-                    )
-                ],
-                "impacts": impacts,
-                "cross_workbook_impacts": cross_impacts.get(key, []),
-                "resolution_status": "warning" if item.warnings else "resolved",
-                "warnings": item.warnings,
-            }
-        )
     return {
-        "schema_version": SCHEMA_VERSION,
-        "workbook": workbook.name,
-        "source": workbook.source,
-        "dashboards": [
-            {
-                "name": dashboard.name,
-                "worksheets": dashboard.worksheets,
-            }
-            for dashboard in workbook.dashboards
-        ],
-        "metric_contracts": metric_contracts(
-            workbook, included, reverse
-        ),
-        "worksheets": worksheets_payload,
-        "fields": fields_payload,
-        "warnings": workbook.warnings,
+        "id": entity_id,
+        "type": entity_type,
+        "name": name,
+        "provenance": {
+            "source_id": source_id,
+            "tableau_object_type": tableau_object_type,
+            "tableau_name": tableau_name,
+        },
+        "attributes": attributes or {},
     }
 
 
-def write_workbook_docs(
-    workbook: Workbook,
-    output_root: Path,
-    emit_json: bool,
-    cross_impacts: dict[str, list[dict[str, object]]] | None = None,
-) -> tuple[Path, int, int]:
-    cross_impacts = cross_impacts or {}
-    included = relevant_fields(workbook)
-    reverse = reverse_dependencies(workbook.fields, included)
-    workbook_dir = output_root / slugify(workbook.name, slugify(Path(workbook.source).stem))
-    workbook_dir.mkdir(parents=True, exist_ok=True)
-    worksheets_filename = worksheets_markdown_filename(workbook.name)
-    field_impact_filename = field_impact_markdown_filename(workbook.name)
+def _relation(
+    source: str,
+    relation_type: str,
+    target: str,
+    *,
+    direct: bool = True,
+) -> dict[str, object]:
+    return {
+        "from": source,
+        "type": relation_type,
+        "to": target,
+        "evidence": {"source": "tableau", "direct": direct},
+    }
 
-    worksheet_slugs = unique_slugs((sheet.name, sheet.name) for sheet in workbook.worksheets)
-    field_slugs = unique_slugs(
-        (key, workbook.fields[key].caption) for key in included
-    )
 
-    ordered_worksheets = sorted(
-        workbook.worksheets, key=lambda item: item.name.casefold()
+def normalized_knowledge_payload(workbooks: list[Workbook]) -> dict[str, object]:
+    """Build a deterministic, presentation-independent Tableau source model."""
+    source_slugs = unique_slugs(
+        (str(index), workbook.name) for index, workbook in enumerate(workbooks)
     )
-    worksheets_lines = [
-        f"# {workbook.name} Worksheets",
-        "",
-        f"Workbook: **{workbook.name}**",
-        "",
-        "## Contents",
-        "",
-    ]
-    if workbook.dashboards:
-        worksheet_by_name = {
-            worksheet.name: worksheet for worksheet in workbook.worksheets
+    sources: list[dict[str, object]] = []
+    entities: list[dict[str, object]] = []
+    relations: list[dict[str, object]] = []
+    warnings: list[dict[str, object]] = []
+    published_fields: dict[tuple[str, str], list[str]] = defaultdict(list)
+
+    for workbook_index, workbook in enumerate(workbooks):
+        workbook_key = str(workbook_index)
+        workbook_slug = source_slugs[workbook_key]
+        source_id = f"tableau-workbook:{workbook_slug}"
+        sources.append(
+            {
+                "id": source_id,
+                "type": "tableau_workbook",
+                "name": workbook.name,
+                "file": workbook.source,
+            }
+        )
+        for warning in workbook.warnings:
+            warnings.append({"source_id": source_id, "message": warning})
+
+        included = relevant_fields(workbook)
+        datasource_names = sorted(
+            {workbook.fields[key].datasource for key in included}, key=str.casefold
+        )
+        datasource_slugs = unique_slugs(
+            (
+                name,
+                next(
+                    field.datasource_caption
+                    for field in workbook.fields.values()
+                    if field.datasource == name
+                ),
+            )
+            for name in datasource_names
+        )
+        datasource_ids = {
+            name: f"datasource:{workbook_slug}:{datasource_slugs[name]}"
+            for name in datasource_names
         }
-        assigned_worksheets: set[str] = set()
-        for dashboard in workbook.dashboards:
-            worksheets_lines.extend(
-                [f"### Dashboard: {dashboard.name}", ""]
+        for name in datasource_names:
+            representative = next(
+                field for field in workbook.fields.values() if field.datasource == name
             )
-            dashboard_worksheets = [
-                worksheet_by_name[name]
-                for name in dashboard.worksheets
-                if name in worksheet_by_name
-            ]
-            if dashboard_worksheets:
-                for worksheet in dashboard_worksheets:
-                    assigned_worksheets.add(worksheet.name)
-                    worksheets_lines.append(
-                        f"- [{worksheet.name}]"
-                        f"(#{worksheet_slugs[worksheet.name]})"
-                    )
-            else:
-                worksheets_lines.append("No worksheets detected.")
-            worksheets_lines.append("")
-        unassigned_worksheets = [
-            worksheet
-            for worksheet in ordered_worksheets
-            if worksheet.name not in assigned_worksheets
-        ]
-        if unassigned_worksheets:
-            worksheets_lines.extend(["### Not used in a Dashboard", ""])
-            for worksheet in unassigned_worksheets:
-                worksheets_lines.append(
-                    f"- [{worksheet.name}](#{worksheet_slugs[worksheet.name]})"
+            entities.append(
+                _entity(
+                    datasource_ids[name],
+                    "datasource",
+                    representative.datasource_caption,
+                    source_id,
+                    "datasource",
+                    name,
+                    {
+                        "internal_name": name,
+                        "published_identity": representative.datasource_identity,
+                    },
                 )
-    else:
-        for worksheet in ordered_worksheets:
-            worksheets_lines.append(
-                f"- [{worksheet.name}](#{worksheet_slugs[worksheet.name]})"
             )
-    for worksheet in ordered_worksheets:
-        worksheets_lines.extend(
-            [
-                "",
-                "---",
-                "",
-                worksheet_page(
-                    workbook,
-                    worksheet,
-                    field_slugs,
-                    field_impact_filename,
-                ).rstrip(),
-            ]
-        )
-    (workbook_dir / worksheets_filename).write_text(
-        "\n".join(worksheets_lines).rstrip() + "\n",
-        encoding="utf-8",
-    )
 
-    ordered_fields = sorted(
-        included,
-        key=lambda value: (
-            workbook.fields[value].datasource_caption.casefold(),
-            workbook.fields[value].caption.casefold(),
-            workbook.fields[value].datasource.casefold(),
-        ),
-    )
-    impact_lines = [
-        '<a id="top"></a>',
-        "",
-        f"# {workbook.name} Field Impact",
-        "",
-        "| Datasource | Field | Type | Direct Worksheets | Total Impacted Worksheets |",
-        "|---|---|---|---:|---:|",
-    ]
-    for key in ordered_fields:
-        item = workbook.fields[key]
-        direct_count = sum(key in sheet.direct_fields for sheet in workbook.worksheets)
-        impact_count = sum(
-            shortest_impact_path(key, sheet, reverse) is not None
-            for sheet in workbook.worksheets
+        field_slugs = unique_slugs(
+            (key, workbook.fields[key].caption) for key in included
         )
-        impact_lines.append(
-            f"| {markdown_escape(item.datasource_caption)} | "
-            f"[{markdown_escape(item.caption)}](#{field_slugs[key]}) | "
-            f"{item.field_type} | {direct_count} | {impact_count} |"
-        )
-    for key in ordered_fields:
-        impact_lines.extend(
-            [
-                "",
-                "---",
-                "",
-                field_page(
-                    workbook,
-                    key,
-                    included,
-                    reverse,
-                    worksheet_slugs,
-                    field_slugs,
-                    cross_impacts.get(key, []),
-                    worksheets_filename,
-                ).rstrip(),
-            ]
-        )
-    (workbook_dir / field_impact_filename).write_text(
-        "\n".join(impact_lines).rstrip() + "\n",
-        encoding="utf-8",
-    )
-
-    readme_lines = [
-        f"# {workbook.name}",
-        "",
-        f"Source: `{workbook.source}`",
-        "",
-        f"- Worksheets: {len(workbook.worksheets)}",
-        f"- Relevant fields: {len(included)}",
-        f"- [Worksheets]({quote(worksheets_filename)})",
-        f"- [Field Impact]({quote(field_impact_filename)})",
-        "",
-        "## Worksheets",
-        "",
-    ]
-    for worksheet in sorted(workbook.worksheets, key=lambda item: item.name.casefold()):
-        worksheet_fields = worksheet_relevant_fields(worksheet, workbook.fields)
-        calc_count = sum(
-            workbook.fields[key].raw_formula is not None
+        field_ids = {
+            key: f"field:{workbook_slug}:{field_slugs[key]}" for key in included
+        }
+        calculation_ids = {
+            key: f"calculation:{workbook_slug}:{field_slugs[key]}"
+            for key in included
+            if workbook.fields[key].raw_formula is not None
             and not workbook.fields[key].is_parameter
-            for key in worksheet_fields
-        )
-        readme_lines.append(
-            f"- [{worksheet.name}]"
-            f"({quote(worksheets_filename)}#{worksheet_slugs[worksheet.name]}) "
-            f"— {calc_count} calculations, {len(worksheet.filters)} filters"
-        )
-    (workbook_dir / workbook_markdown_filename(workbook.name)).write_text(
-        "\n".join(readme_lines).rstrip() + "\n",
-        encoding="utf-8",
-    )
-    if emit_json:
-        (workbook_dir / workbook_json_filename(workbook.name)).write_text(
-            json.dumps(
-                workbook_payload(workbook, included, reverse, cross_impacts),
-                ensure_ascii=False,
-                indent=2,
-                sort_keys=True,
+        }
+        metric_ids = {
+            key: f"metric:{workbook_slug}:{field_slugs[key]}"
+            for key in included
+            if not workbook.fields[key].is_parameter
+            and (
+                (workbook.fields[key].role or "").casefold() == "measure"
+                or (
+                    workbook.fields[key].raw_formula is not None
+                    and (workbook.fields[key].role or "").casefold()
+                    != "dimension"
+                )
             )
-            + "\n",
-            encoding="utf-8",
-        )
-    return workbook_dir, len(workbook.worksheets), len(included)
+        }
 
+        for key in sorted(included, key=lambda value: field_ids[value]):
+            item = workbook.fields[key]
+            entities.append(
+                _entity(
+                    field_ids[key],
+                    "field",
+                    item.caption,
+                    source_id,
+                    "column",
+                    item.internal_name,
+                    {
+                        "internal_name": item.internal_name,
+                        "datatype": item.datatype,
+                        "role": item.role,
+                        "field_type": item.field_type,
+                        "classification": formula_classification(
+                            item.raw_formula, item.is_parameter
+                        ),
+                        "resolution_status": (
+                            "warning" if item.warnings else "resolved"
+                        ),
+                        "warnings": item.warnings,
+                    },
+                )
+            )
+            relations.append(
+                _relation(field_ids[key], "comes_from", datasource_ids[item.datasource])
+            )
+            if item.datasource_identity:
+                published_fields[
+                    (item.datasource_identity, item.internal_name.casefold())
+                ].append(field_ids[key])
 
-def write_root_index(
-    output_root: Path,
-    summaries: list[tuple[Workbook, Path, int, int]],
-) -> None:
-    lines = [
-        "# Tableau Reverse-Engineering Catalog",
-        "",
-        "| Workbook | Worksheets | Relevant Fields |",
-        "|---|---:|---:|",
-    ]
-    for workbook, workbook_dir, worksheet_count, field_count in sorted(
-        summaries, key=lambda item: item[0].name.casefold()
-    ):
-        lines.append(
-            f"| [{markdown_escape(workbook.name)}]"
-            f"({quote(workbook_dir.name)}/"
-            f"{quote(workbook_markdown_filename(workbook.name))}) | "
-            f"{worksheet_count} | {field_count} |"
+            if key in calculation_ids:
+                calculation_id = calculation_ids[key]
+                entities.append(
+                    _entity(
+                        calculation_id,
+                        "calculation",
+                        item.caption,
+                        source_id,
+                        "calculation",
+                        item.internal_name,
+                        {
+                            "formula_tableau": item.raw_formula,
+                            "formula_display": item.display_formula,
+                            "classification": formula_classification(
+                                item.raw_formula, item.is_parameter
+                            ),
+                            "warnings": item.warnings,
+                        },
+                    )
+                )
+                relations.append(
+                    _relation(field_ids[key], "calculated_by", calculation_id)
+                )
+                for dependency in item.dependencies:
+                    if dependency not in included:
+                        continue
+                    target = calculation_ids.get(dependency, field_ids[dependency])
+                    relations.append(
+                        _relation(calculation_id, "depends_on", target)
+                    )
+
+            if key in metric_ids:
+                metric_id = metric_ids[key]
+                entities.append(
+                    _entity(
+                        metric_id,
+                        "metric",
+                        item.caption,
+                        source_id,
+                        "column",
+                        item.internal_name,
+                        {
+                            "semantic_status": "inferred",
+                            "calculation_scope": metric_calculation_scope(item),
+                        },
+                    )
+                )
+                if key in calculation_ids:
+                    relations.append(
+                        _relation(metric_id, "calculated_by", calculation_ids[key])
+                    )
+                    for dependency in item.dependencies:
+                        if dependency in included:
+                            relations.append(
+                                _relation(
+                                    metric_id,
+                                    "depends_on",
+                                    calculation_ids.get(
+                                        dependency, field_ids[dependency]
+                                    ),
+                                )
+                            )
+                else:
+                    relations.append(
+                        _relation(metric_id, "depends_on", field_ids[key])
+                    )
+
+        worksheet_slugs = unique_slugs(
+            (worksheet.name, worksheet.name) for worksheet in workbook.worksheets
         )
-    (output_root / "README.md").write_text(
-        "\n".join(lines).rstrip() + "\n",
-        encoding="utf-8",
+        visual_ids = {
+            worksheet.name: f"visual:{workbook_slug}:{worksheet_slugs[worksheet.name]}"
+            for worksheet in workbook.worksheets
+        }
+        dashboard_slugs = unique_slugs(
+            (dashboard.name, dashboard.name) for dashboard in workbook.dashboards
+        )
+        dashboard_ids = {
+            dashboard.name: f"dashboard:{workbook_slug}:{dashboard_slugs[dashboard.name]}"
+            for dashboard in workbook.dashboards
+        }
+
+        for dashboard in sorted(
+            workbook.dashboards, key=lambda value: value.name.casefold()
+        ):
+            dashboard_id = dashboard_ids[dashboard.name]
+            entities.append(
+                _entity(
+                    dashboard_id,
+                    "dashboard",
+                    dashboard.name,
+                    source_id,
+                    "dashboard",
+                    dashboard.name,
+                )
+            )
+            dashboard_datasources: set[str] = set()
+            for worksheet_name in dashboard.worksheets:
+                visual_id = visual_ids.get(worksheet_name)
+                if visual_id is None:
+                    continue
+                relations.append(_relation(dashboard_id, "contains", visual_id))
+                worksheet = next(
+                    item for item in workbook.worksheets if item.name == worksheet_name
+                )
+                for field_key_value in worksheet_relevant_fields(
+                    worksheet, workbook.fields
+                ):
+                    if field_key_value in included:
+                        dashboard_datasources.add(
+                            datasource_ids[workbook.fields[field_key_value].datasource]
+                        )
+            for datasource_id in sorted(dashboard_datasources):
+                relations.append(
+                    _relation(dashboard_id, "depends_on", datasource_id, direct=False)
+                )
+
+        for worksheet in sorted(
+            workbook.worksheets, key=lambda value: value.name.casefold()
+        ):
+            visual_id = visual_ids[worksheet.name]
+            entities.append(
+                _entity(
+                    visual_id,
+                    "visual",
+                    worksheet.name,
+                    source_id,
+                    "worksheet",
+                    worksheet.name,
+                    {"warnings": worksheet.warnings},
+                )
+            )
+            displayed_keys = {
+                usage.field_key
+                for usage in worksheet.field_usages
+                if usage.context not in {"filter", "groupfilter"}
+            }
+            for key in sorted(worksheet.direct_fields):
+                if key not in included:
+                    continue
+                relations.append(_relation(visual_id, "uses", field_ids[key]))
+                if key in calculation_ids:
+                    relations.append(
+                        _relation(visual_id, "uses", calculation_ids[key])
+                    )
+                if key in metric_ids and key in displayed_keys:
+                    relations.append(
+                        _relation(visual_id, "displays", metric_ids[key])
+                    )
+
+            filter_labels = [
+                f"{item.field_label}-{index}"
+                for index, item in enumerate(worksheet.filters, start=1)
+            ]
+            filter_slugs = unique_slugs(
+                (str(index), label) for index, label in enumerate(filter_labels)
+            )
+            for index, item in enumerate(worksheet.filters):
+                filter_id = (
+                    f"filter:{workbook_slug}:{worksheet_slugs[worksheet.name]}:"
+                    f"{filter_slugs[str(index)]}"
+                )
+                entities.append(
+                    _entity(
+                        filter_id,
+                        "filter",
+                        item.field_label,
+                        source_id,
+                        "filter",
+                        item.raw_reference,
+                        {"operator": item.operator, "value": item.value},
+                    )
+                )
+                relations.append(_relation(visual_id, "affected_by", filter_id))
+                if item.field_key in field_ids:
+                    relations.append(
+                        _relation(filter_id, "filters_on", field_ids[item.field_key])
+                    )
+
+    for matching_fields in published_fields.values():
+        ordered = sorted(set(matching_fields))
+        for index, source in enumerate(ordered):
+            for target in ordered[index + 1 :]:
+                relations.append(
+                    _relation(source, "same_source_field_as", target, direct=False)
+                )
+
+    entities.sort(key=lambda item: str(item["id"]))
+    relations = sorted(
+        {
+            (str(item["from"]), str(item["type"]), str(item["to"])): item
+            for item in relations
+        }.values(),
+        key=lambda item: (str(item["from"]), str(item["type"]), str(item["to"])),
     )
+    warnings.sort(key=lambda item: (str(item["source_id"]), str(item["message"])))
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "source_type": "tableau",
+        "sources": sources,
+        "entities": entities,
+        "relations": relations,
+        "warnings": warnings,
+    }
 
 
 def build_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Generate a reverse-engineering catalog from Tableau workbooks."
+        description="Extract normalized semantic metadata from Tableau workbooks."
     )
     parser.add_argument("input", type=Path, help=".twb/.twbx file or directory")
     parser.add_argument("--output", type=Path, required=True, help="output directory")
     parser.add_argument("--workbook", help="only process this workbook name")
-    parser.add_argument(
-        "--worksheet",
-        action="append",
-        default=[],
-        help="only document this worksheet name; may be repeated",
-    )
-    parser.add_argument(
-        "--emit-json",
-        action="store_true",
-        help="also emit a compact <Workbook>.json file",
-    )
     parser.add_argument(
         "--strict",
         action="store_true",
@@ -1535,7 +1053,6 @@ def run(args: argparse.Namespace) -> int:
     if not files:
         raise CatalogError(f"No .twb or .twbx files found in {args.input}")
     args.output.mkdir(parents=True, exist_ok=True)
-    summaries: list[tuple[Workbook, Path, int, int]] = []
     workbooks: list[Workbook] = []
     failures: list[str] = []
     for source in files:
@@ -1543,40 +1060,33 @@ def run(args: argparse.Namespace) -> int:
             workbook = parse_workbook(source)
             if args.workbook and workbook.name != args.workbook:
                 continue
-            if args.worksheet:
-                requested = set(args.worksheet)
-                workbook.worksheets = [
-                    sheet for sheet in workbook.worksheets if sheet.name in requested
-                ]
             workbooks.append(workbook)
         except (CatalogError, OSError, zipfile.BadZipFile) as exc:
             if args.strict:
                 raise
             failures.append(f"{source.name}: {exc}")
-    all_cross_impacts = build_cross_workbook_impacts(workbooks)
-    for index, workbook in enumerate(workbooks):
-        workbook_cross_impacts = {
-            key: impacts
-            for (workbook_index, key), impacts in all_cross_impacts.items()
-            if workbook_index == index
-        }
-        workbook_dir, worksheet_count, field_count = write_workbook_docs(
-            workbook,
-            args.output,
-            args.emit_json,
-            workbook_cross_impacts,
+    if workbooks:
+        sources_dir = args.output / "sources"
+        sources_dir.mkdir(parents=True, exist_ok=True)
+        output_path = sources_dir / "tableau.json"
+        temporary_path = sources_dir / ".tableau.json.tmp"
+        temporary_path.write_text(
+            json.dumps(
+                normalized_knowledge_payload(workbooks),
+                indent=2,
+                ensure_ascii=False,
+            )
+            + "\n",
+            encoding="utf-8",
         )
-        summaries.append(
-            (workbook, workbook_dir, worksheet_count, field_count)
-        )
-    write_root_index(args.output, summaries)
-    print(f"Processed workbooks: {len(summaries)}")
-    print(f"Output: {args.output.resolve()}")
+        temporary_path.replace(output_path)
+    print(f"Processed workbooks: {len(workbooks)}")
+    print(f"Output: {(args.output / 'sources' / 'tableau.json').resolve()}")
     if failures:
         print("Warnings:", file=sys.stderr)
         for failure in failures:
             print(f"- {failure}", file=sys.stderr)
-    return 0 if summaries else 1
+    return 0 if workbooks else 1
 
 
 def main() -> int:

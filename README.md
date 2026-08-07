@@ -1,211 +1,165 @@
-# Tableau Reverse-Engineering Catalog
+# Tableau Semantic Knowledge Base
 
-This project turns Tableau `.twb` and `.twbx` workbooks into a small,
-navigable Markdown catalog focused on:
+This project extracts technical metadata from Tableau `.twb` and `.twbx`
+workbooks and normalizes it into a small, file-based Semantic Knowledge Base.
+Tableau is a source of evidence, not the final documentation format.
 
-- calculated fields used by each worksheet;
-- worksheet filters;
-- readable formulas using Tableau captions;
-- forward calculation dependencies;
-- reverse field impact analysis;
-- worksheets affected directly or indirectly by a field change.
+The MVP deliberately uses JSON, Markdown, YAML front matter, and plain Python.
+It has no database, graph database, vector database, Tableau Server connection,
+Confluence synchronization, or active MCP integration.
 
-## Analytics MVP: DuckDB over Parquet
+## Data flow
 
-The current MVP adds a small deterministic analytics core. It maps approved
-business names to Parquet columns, builds controlled SQL, executes it with
-DuckDB, and compares results with saved Tableau reference cases.
-
-Start with [ANALYTICS_MVP_GUIDE.md](ANALYTICS_MVP_GUIDE.md). The MCP server is
-kept as prior work but is not required for this MVP.
-
-The Tableau extractor uses only the Python standard library and never connects
-to Tableau Server.
-For the MCP architecture, secure semantic query layer, workplace rollout, and
-presentation guidance, see [MCP_SERVER.md](MCP_SERVER.md).
-
-## Quick start
-
-Python 3.10 or newer is required.
-
-Generate documentation for one workbook:
-
-```bash
-python3 tableau_doc.py examples/sample_superstore.twb --output docs
+```text
+TWB/TWBX
+   ↓
+tableau_doc.py
+   ↓
+knowledge/sources/tableau.json ──┐
+                                ├─ knowledge_build.py
+knowledge/manual/**/*.md ───────┘
+                                      ↓
+                             knowledge/markdown/
 ```
 
-Scan every `.twb` and `.twbx` below a directory:
+`tableau_doc.py` is only a Tableau metadata extractor and normalizer.
+`knowledge_build.py` validates the complete file-based model, provides simple
+dependency/impact functions, and renders disposable Markdown pages.
+
+## Install
+
+Extraction uses Python 3.10 or newer and only the standard library. The
+Knowledge Base builder uses PyYAML:
 
 ```bash
-python3 tableau_doc.py path/to/workbooks --output docs
+python3 -m venv .venv-kb
+source .venv-kb/bin/activate
+pip install -r requirements-kb.txt
 ```
 
-Generate a review-required semantic configuration draft from emitted JSON
-catalogs:
+## Extract Tableau metadata
 
 ```bash
-python3 tableau_doc.py path/to/workbooks --output docs --emit-json
-python3 semantic_config_bootstrap.py docs \
-  --output semantic_config.draft.json
+python3 tableau_doc.py path/to/workbooks --output knowledge
 ```
 
-Review table names, column mappings, descriptions, and aggregation policies
-before changing each datasource from `needs_review` to `approved`. See
-[MCP_SERVER.md](MCP_SERVER.md) for the complete workflow.
+The command scans `.twb` and `.twbx` files and writes one generated source:
 
-Also generate the compact machine-readable representation:
-
-```bash
-python3 tableau_doc.py path/to/workbooks --output docs --emit-json
+```text
+knowledge/
+└── sources/
+    └── tableau.json
 ```
 
-Limit the output to selected content:
+Useful options:
 
 ```bash
 python3 tableau_doc.py path/to/workbooks \
-  --output docs \
+  --output knowledge \
   --workbook "Superstore" \
-  --worksheet "Executive Overview"
+  --strict
 ```
 
-Use `--worksheet` more than once to select multiple worksheets. Use `--strict`
-to stop immediately when a workbook is invalid; without it, directory scans
-continue and report the invalid files as warnings.
+JSON is now mandatory. The former `--emit-json` and `--worksheet` options no
+longer exist because a partial worksheet catalog is unsafe as a Knowledge Base.
 
-## Output
+## Normalized model
+
+```json
+{
+  "schema_version": 2,
+  "source_type": "tableau",
+  "sources": [],
+  "entities": [],
+  "relations": [],
+  "warnings": []
+}
+```
+
+Initial entity types are `dashboard`, `visual`, `metric`, `field`,
+`calculation`, `filter`, and `datasource`. Business Rules are human-authored.
+Each Tableau worksheet becomes one Visual and may belong to zero or more
+Dashboards. Metrics are marked `inferred`, not business-approved.
+
+Relations use explicit IDs and include `contains`, `uses`, `displays`,
+`affected_by`, `filters_on`, `calculated_by`, `depends_on`, `comes_from`, and
+`same_source_field_as`. Reverse usage and impact are computed in memory.
+
+## Add human context
+
+Human content lives below `knowledge/manual` and is never written by the
+extractor or renderer:
 
 ```text
-docs/
-├── README.md
-└── superstore/
-    ├── Superstore.md
-    ├── Superstore - Worksheets.md
-    ├── Superstore - Field Impact.md
-    └── Superstore.json        # only with --emit-json
+knowledge/manual/
+├── dashboards/
+├── visuals/
+├── metrics/
+├── fields/
+├── calculations/
+├── filters/
+├── datasources/
+└── business-rules/
 ```
 
-Each workbook produces only three Markdown files. Its overview file uses the
-visible workbook name. `<Workbook> - Worksheets.md` contains a linked table of
-contents and one anchored section per worksheet.
-`<Workbook> - Field Impact.md` contains the compact field index followed by one
-anchored section per relevant field.
+Example:
 
-The field impact document separates direct worksheet use from transitive
-impact. Every indirect impact includes a dependency path, for example:
+```markdown
+---
+id: metric:coverage-overview:revenue
+type: metric
+description: Revenue recognized in the selected period.
+owner: Finance Analytics
+business_rule_ids:
+  - business-rule:recognized-revenue
+relations:
+  - type: affected_by
+    to: business-rule:recognized-revenue
+---
 
-```text
-Sales → Profit Ratio → Adjusted Profit
+# Revenue
+
+Use this metric for approved financial reporting.
 ```
 
-## How field usage is identified
+Manual pages for Tableau-derived entities must reference an automatic ID. A
+`business_rule` may be entirely manual. Broken IDs, duplicate pages, type
+mismatches, and invalid relations fail validation.
 
-The scanner reads field references from worksheet XML, including shelves,
-encodings, filters, and sort expressions. These visual structures are not
-documented individually; they are reduced to the relationship:
+## Validate and render Markdown
 
-```text
-Worksheet uses Field
+```bash
+python3 knowledge_build.py knowledge --check
+python3 knowledge_build.py knowledge
 ```
 
-Only fields used by a worksheet and their recursive calculation dependencies
-are included. Unused calculations are omitted.
+The builder recreates only `knowledge/markdown`. Every page separates
+`Automatic metadata` from `Human context` and includes relationships and
+reverse `Where used` links. Never edit generated Markdown.
 
-Raw formulas are retained in optional JSON. Markdown formulas replace internal
-names such as `[Calculation_1001]` with visible captions such as
-`[Profit Ratio]` when the mapping is unambiguous. Unknown or ambiguous
-references are preserved and reported instead of guessed.
+## Safety and known limits
 
-## Metric contracts
-
-With `--emit-json`, each workbook includes additive `metric_contracts` designed
-to give LLMs a machine-readable starting point for reproducing Tableau metric
-logic. Each contract records:
-
-- the visible and internal datasource names;
-- the raw Tableau formula and resolved dependencies;
-- the calculation scope, such as aggregate, row-level, LOD, or table
-  calculation;
-- worksheet and Dashboard contexts;
-- detected shelf aggregations, approximate dimensional grain, and worksheet
-  filters;
-- an explicit semantic status, limitations, and extraction warnings.
-
-Metric contracts are semantic evidence, not validated SQL. They remain
-`partial` until the physical data model, relationships, Tableau order of
-operations, a target SQL dialect, and result-level validation are available.
-Existing workbook, worksheet, and field keys remain available for consumers of
-the earlier JSON format.
-
-## Cross-workbook impact
-
-Fields are linked across workbooks only when both workbooks expose the same
-published datasource identity in `repository-location` and the same internal
-field name. Matching captions alone are never considered sufficient.
-
-## Safety and limitations
-
-- `.twbx` packages are inspected without extracting their contents to disk.
-- Tableau extracts, CSV files, images, and other packaged data are ignored.
-- Unsafe ZIP paths and embedded TWB files larger than 50 MiB are rejected.
-- Connection details and credentials are not extracted or documented.
-- Only worksheet filters are analyzed.
-- Dashboard actions, layout, joins, executable SQL generation, result
-  validation, Parquet data, and LLM calls are not yet implemented.
-- Tableau XML varies by release. Unsupported references remain visible as
-  warnings so they can become regression fixtures for later improvements.
+- TWBX packages are read without extracting contents to disk.
+- Unsafe ZIP paths and embedded TWB files above 50 MiB are rejected.
+- Tableau extracts, credentials, and connection data are not read.
+- Only worksheet filters are modeled; dashboard actions are not.
+- Layout, joins, relationships, Tableau order of operations, and SQL
+  equivalence are not modeled.
+- A Tableau rename can change a generated ID and orphan a manual page;
+  validation reports it rather than discarding it.
 
 ## Tests
 
 ```bash
-python3 -m unittest discover -s tests -v
+python3 -m unittest \
+  tests.test_tableau_knowledge \
+  tests.test_knowledge_build \
+  tests.test_analytics_core -v
 ```
 
-The suite covers recursive impact, cycles, duplicate captions, shelf-token
-normalization, safe cross-workbook matching, TWBX handling, path traversal, and
-deterministic output.
+## Legacy components
 
-## V2: local MCP catalog
-
-V2 adds read-only MCP access to the compact JSON produced by V1. Generate JSON
-catalogs first:
-
-```bash
-python3 tableau_doc.py path/to/workbooks --output docs --emit-json
-```
-
-The catalog loader and validation command use only the standard library:
-
-```bash
-python3 tableau_mcp.py \
-  --catalog docs \
-  --semantic-config semantic_config.json \
-  --check
-```
-
-Starting the MCP server requires the optional official Python SDK:
-
-```bash
-pip install -r requirements-mcp.txt
-python3 tableau_mcp.py \
-  --catalog docs \
-  --semantic-config semantic_config.json
-```
-
-The server uses stdio and exposes eight bounded, read-only tools:
-
-- `search_catalog`: search workbooks, worksheets, and fields;
-- `get_field_impact`: retrieve direct, indirect, and cross-workbook impact;
-- `get_metric_contract`: retrieve a metric's semantic recipe and Tableau
-  contexts;
-- `get_dimensions`: list configured dimensions with descriptions;
-- `get_indicators`: list indicators with descriptions and aggregation policies;
-- `get_data`: execute a bounded query compiled from validated semantic inputs;
-- `get_worksheet`: retrieve filters, calculations, and direct fields;
-- `trace_dependencies`: trace upstream or downstream lineage with a depth cap.
-
-No MCP tool reads TWB/TWBX files, queries Tableau Server, or modifies the
-catalog. `get_data` can read only the datasource configured in
-`semantic_config.json`; the initial adapter opens SQLite in read-only mode and
-returns at most 1,000 rows. Copy `mcp_config.example.json` and replace the
-placeholder paths with absolute local paths for the target MCP client. See
-[MCP_SERVER.md](MCP_SERVER.md) for the security model and rollout guide.
+`tableau_mcp.py`, `semantic_config_bootstrap.py`, and `MCP_SERVER.md` target the
+former schema-v1 catalog and are not compatible with `tableau.json` v2. They
+remain as historical code only. `analytics_core.py` is an independent
+DuckDB/Parquet experiment and is not part of the Knowledge Base pipeline.

@@ -5,9 +5,12 @@ docs/
 /examples/
 /tests/*
 !/tests/test_analytics_core.py
+!/tests/test_knowledge_build.py
+!/tests/test_tableau_knowledge.py
 semantic_config.json
 semantic_config.draft.json
 /.venv-analytics/
+/.venv-kb/
 /data/
 /analytics_config.json
 /request.json
