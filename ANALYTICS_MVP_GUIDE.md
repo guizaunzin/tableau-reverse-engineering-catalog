@@ -1,5 +1,8 @@
 # Guia rápido do MVP analítico
 
+> **Experiência independente:** esta camada analítica não faz parte do pipeline
+> da Semantic Knowledge Base e não consome o modelo source schema v2.
+
 ## 1. Preparar o ambiente
 
 ```bash

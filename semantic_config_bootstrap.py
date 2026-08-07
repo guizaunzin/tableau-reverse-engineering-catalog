@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate a review-required semantic configuration from metric contracts."""
+"""Legacy schema-v1 utility for generating config from metric contracts."""
 
 from __future__ import annotations
 

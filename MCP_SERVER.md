@@ -1,5 +1,9 @@
 # MCP Server: Implementation and Adoption Guide
 
+> **Legacy:** this server consumes the former schema-v1 Tableau catalog and is
+> not compatible with the Semantic Knowledge Base v2. It is intentionally not
+> being adapted in the current MVP.
+
 ## Executive summary
 
 The MCP server turns two controlled sources into tools that an LLM can query:
