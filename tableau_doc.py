@@ -70,6 +70,17 @@ TABLE_CALC_FUNCTIONS = {
     "WINDOW_VAR",
     "WINDOW_VARP",
 }
+DISPLAY_CONTEXTS = {
+    "angle",
+    "color",
+    "cols",
+    "lod",
+    "rows",
+    "shape",
+    "size",
+    "text",
+    "tooltip",
+}
 
 
 class CatalogError(RuntimeError):
@@ -131,6 +142,7 @@ class Worksheet:
 class Dashboard:
     name: str
     worksheets: list[str] = field(default_factory=list)
+    layout: dict[str, object] | None = None
 
 
 @dataclass
@@ -495,6 +507,32 @@ def extract_filter(
     )
 
 
+def is_dummy_field(item: Field) -> bool:
+    """Return whether a Tableau field is a non-semantic Dummy helper."""
+    return bool(
+        re.search(
+            r"\bdummy\b",
+            f"{item.caption} {unbracket(item.internal_name)}",
+            flags=re.IGNORECASE,
+        )
+    )
+
+
+def is_ignored_filter(item: FilterInfo, fields: dict[str, Field]) -> bool:
+    """Exclude Tableau action filters and filters backed by Dummy fields."""
+    if re.search(r"\[Action(?:\s|\()", item.raw_reference, flags=re.IGNORECASE):
+        return True
+    if item.field_key is not None and is_dummy_field(fields[item.field_key]):
+        return True
+    return bool(re.search(r"\bdummy\b", item.field_label, flags=re.IGNORECASE))
+
+
+def filter_signature(item: FilterInfo) -> tuple[str, str, str]:
+    """Return the workbook-level semantic identity of a Tableau filter."""
+    field_identity = item.field_key or item.raw_reference.casefold()
+    return (field_identity, item.operator.casefold(), item.value)
+
+
 def extract_worksheets(
     root: ET.Element,
     fields: dict[str, Field],
@@ -554,8 +592,144 @@ def extract_dashboards(
                 and worksheet_name not in referenced
             ):
                 referenced.append(worksheet_name)
-        dashboards.append(Dashboard(name=name, worksheets=referenced))
+        dashboards.append(
+            Dashboard(
+                name=name,
+                worksheets=referenced,
+                layout=extract_dashboard_layout(node, worksheet_names),
+            )
+        )
     return dashboards
+
+
+def _direct_child(node: ET.Element, tag_name: str) -> ET.Element | None:
+    return next(
+        (child for child in node if local_name(child.tag) == tag_name), None
+    )
+
+
+def _layout_coordinates(zone: ET.Element) -> dict[str, int] | None:
+    names = {"x": "x", "y": "y", "width": "w", "height": "h"}
+    values: dict[str, int] = {}
+    try:
+        for output_name, xml_name in names.items():
+            raw_value = zone.get(xml_name)
+            if raw_value is None:
+                return None
+            values[output_name] = int(raw_value)
+    except ValueError:
+        return None
+    if (
+        values["x"] < 0
+        or values["y"] < 0
+        or values["width"] <= 0
+        or values["height"] <= 0
+        or any(value > 100000 for value in values.values())
+    ):
+        return None
+    return values
+
+
+def _zone_text(zone: ET.Element) -> str:
+    fragments = [
+        (item.text or "").strip()
+        for item in zone.iter()
+        if local_name(item.tag) == "run" and (item.text or "").strip()
+    ]
+    return " ".join(fragments)
+
+
+def extract_dashboard_layout(
+    dashboard: ET.Element,
+    worksheet_names: set[str],
+) -> dict[str, object]:
+    """Extract a conservative, presentation-independent dashboard wireframe."""
+    size = _direct_child(dashboard, "size")
+    warnings: list[str] = []
+    if size is None:
+        return {
+            "status": "unavailable",
+            "warnings": ["Dashboard has no fixed desktop size metadata."],
+        }
+    sizing_mode = size.get("sizing-mode") or "unknown"
+    try:
+        min_width = int(size.get("minwidth") or "")
+        max_width = int(size.get("maxwidth") or "")
+        min_height = int(size.get("minheight") or "")
+        max_height = int(size.get("maxheight") or "")
+    except ValueError:
+        min_width = max_width = min_height = max_height = 0
+    if (
+        sizing_mode != "fixed"
+        or min_width <= 0
+        or min_height <= 0
+        or min_width != max_width
+        or min_height != max_height
+    ):
+        return {
+            "status": "unavailable",
+            "sizing_mode": sizing_mode,
+            "warnings": ["Dashboard does not have a valid fixed desktop size."],
+        }
+
+    items: list[dict[str, object]] = []
+    drawable_order = 0
+    auxiliary_types = {
+        "text": "text",
+        "color": "control",
+        "paramctrl": "parameter_control",
+        "dashboard-object": "navigation",
+    }
+    for zone in (
+        item for item in dashboard.iter() if local_name(item.tag) == "zone"
+    ):
+        zone_type = zone.get("type-v2") or ""
+        worksheet_name = zone.get("name") or zone.get("worksheet")
+        kind: str | None = None
+        item: dict[str, object] = {}
+        if worksheet_name in worksheet_names and zone_type not in auxiliary_types:
+            kind = "visual"
+            item["worksheet_name"] = worksheet_name
+        elif zone_type in auxiliary_types:
+            kind = auxiliary_types[zone_type]
+            label = _zone_text(zone) or zone.get("name") or zone.get("param")
+            if label:
+                item["label"] = label
+        elif worksheet_name and not zone_type:
+            warnings.append(
+                f"Skipped zone {zone.get('id') or '?'} with unresolved worksheet "
+                f"{worksheet_name!r}."
+            )
+            continue
+        else:
+            continue
+
+        coordinates = _layout_coordinates(zone)
+        if coordinates is None:
+            warnings.append(
+                f"Skipped {kind} zone {zone.get('id') or '?'} with missing or invalid coordinates."
+            )
+            continue
+        drawable_order += 1
+        item = {
+            "document_order": drawable_order,
+            "tableau_zone_id": zone.get("id") or "",
+            "kind": kind,
+            **item,
+            **coordinates,
+            "hidden": (zone.get("hidden-by-user") or "").casefold() == "true",
+        }
+        items.append(item)
+
+    return {
+        "status": "partial" if warnings else "complete",
+        "sizing_mode": sizing_mode,
+        "dashboard_width": min_width,
+        "dashboard_height": min_height,
+        "coordinate_space": {"width": 100000, "height": 100000},
+        "items": items,
+        "warnings": warnings,
+    }
 
 
 def parse_workbook(path: Path) -> Workbook:
@@ -667,6 +841,119 @@ def metric_calculation_scope(item: Field) -> str:
     return "base_measure"
 
 
+def _rule_expression(value: str) -> str:
+    compact = " ".join(value.replace("\r", " ").replace("\n", " ").split())
+    compact = re.sub(r"\[([^\]]+)\]", r"\1", compact)
+    compact = re.sub(r"\s*=\s*TRUE\b", " is true", compact, flags=re.IGNORECASE)
+    return compact.strip()
+
+
+def inferred_rule_attributes(item: Field) -> dict[str, object] | None:
+    """Return a conservative deterministic rule candidate for a metric field."""
+    formula = item.raw_formula
+    if not formula:
+        return None
+    name_tokens = {
+        token
+        for token in re.split(r"[^a-z0-9]+", item.caption.casefold())
+        if token
+    }
+    presentation_tokens = {
+        "color",
+        "dummy",
+        "hide",
+        "label",
+        "show",
+        "sign",
+        "title",
+        "tooltip",
+    }
+    upper_formula = formula.upper()
+    if (
+        name_tokens.intersection(presentation_tokens)
+        or re.search(r"[+-]\s*$", item.caption)
+        or "STR(" in upper_formula
+        or "▲" in formula
+        or "▼" in formula
+    ):
+        return None
+
+    display_formula = item.display_formula or formula
+    conditional = re.search(
+        r"\bIF\s+(.+?)\s+THEN\s+(.+?)\s+END\b",
+        display_formula,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    aggregate = re.search(
+        r"\b(COUNTD|COUNT|SUM|AVG|MIN|MAX)\s*\(\s*IF\b",
+        display_formula,
+        flags=re.IGNORECASE,
+    )
+    is_lod = "{" in formula and "}" in formula
+    is_case = bool(re.search(r"\bCASE\b", formula, flags=re.IGNORECASE))
+    if conditional is not None and aggregate is None and re.search(
+        r"\bELSE\b", formula, flags=re.IGNORECASE
+    ):
+        return None
+    if conditional is None and not is_lod and not is_case:
+        return None
+
+    date_logic = bool(
+        re.search(
+            r"\b(YTD|LYTD|DATE|DATEADD|DATEDIFF|DATETRUNC|TODAY|YEAR|MONTH|WEEK)\b",
+            f"{item.caption} {formula}",
+            flags=re.IGNORECASE,
+        )
+    )
+    if date_logic:
+        rule_kind = "time_window"
+    elif is_lod:
+        rule_kind = "aggregation_scope"
+    elif aggregate:
+        rule_kind = "conditional_aggregation"
+    else:
+        rule_kind = "inclusion_exclusion"
+
+    if conditional is not None:
+        condition = _rule_expression(conditional.group(1))
+        result = _rule_expression(conditional.group(2))
+        if aggregate:
+            operation = aggregate.group(1).upper()
+            verb = {
+                "COUNTD": "counts distinct",
+                "COUNT": "counts",
+                "SUM": "sums",
+                "AVG": "averages",
+                "MIN": "takes the minimum of",
+                "MAX": "takes the maximum of",
+            }[operation]
+            statement = f"{item.caption} {verb} {result} only when {condition}."
+        else:
+            statement = f"{item.caption} applies {result} only when {condition}."
+    elif is_lod:
+        statement = (
+            f"{item.caption} uses a Tableau level-of-detail expression to define "
+            "its aggregation scope."
+        )
+    else:
+        statement = f"{item.caption} selects its result using a CASE condition."
+
+    field_mentions = {item.caption}
+    for match in FIELD_REFERENCE_RE.finditer(display_formula):
+        _, final_token = reference_parts(match.group(0))
+        field_mentions.add(unbracket(final_token))
+
+    return {
+        "semantic_status": "inferred",
+        "confidence": "high" if aggregate or is_lod else "medium",
+        "rule_kind": rule_kind,
+        "statement": statement,
+        "field_mentions": sorted(field_mentions, key=str.casefold),
+        "inference_method": "deterministic_tableau_formula_v1",
+        "formula_tableau": formula,
+    }
+
+
 def _entity(
     entity_id: str,
     entity_type: str,
@@ -730,7 +1017,11 @@ def normalized_knowledge_payload(workbooks: list[Workbook]) -> dict[str, object]
         for warning in workbook.warnings:
             warnings.append({"source_id": source_id, "message": warning})
 
-        included = relevant_fields(workbook)
+        included = {
+            key
+            for key in relevant_fields(workbook)
+            if not is_dummy_field(workbook.fields[key])
+        }
         datasource_names = sorted(
             {workbook.fields[key].datasource for key in included}, key=str.casefold
         )
@@ -894,25 +1185,85 @@ def normalized_knowledge_payload(workbooks: list[Workbook]) -> dict[str, object]
                         _relation(metric_id, "depends_on", field_ids[key])
                     )
 
+        worksheet_entries = list(enumerate(workbook.worksheets))
         worksheet_slugs = unique_slugs(
-            (worksheet.name, worksheet.name) for worksheet in workbook.worksheets
+            (str(index), worksheet.name)
+            for index, worksheet in worksheet_entries
         )
         visual_ids = {
-            worksheet.name: f"visual:{workbook_slug}:{worksheet_slugs[worksheet.name]}"
-            for worksheet in workbook.worksheets
+            index: f"visual:{workbook_slug}:{worksheet_slugs[str(index)]}"
+            for index, _ in worksheet_entries
         }
+        worksheet_indices_by_name: dict[str, list[int]] = defaultdict(list)
+        for index, worksheet in worksheet_entries:
+            worksheet_indices_by_name[worksheet.name].append(index)
+
+        semantic_filters: dict[tuple[str, str, str], FilterInfo] = {}
+        for _, worksheet in worksheet_entries:
+            for item in worksheet.filters:
+                if is_ignored_filter(item, workbook.fields):
+                    continue
+                semantic_filters.setdefault(filter_signature(item), item)
+        filter_slugs = unique_slugs(
+            (
+                json.dumps(signature, ensure_ascii=False),
+                item.field_label,
+            )
+            for signature, item in semantic_filters.items()
+        )
+        filter_ids = {
+            signature: (
+                f"filter:{workbook_slug}:"
+                f"{filter_slugs[json.dumps(signature, ensure_ascii=False)]}"
+            )
+            for signature in semantic_filters
+        }
+        emitted_filters: set[tuple[str, str, str]] = set()
+
+        dashboard_entries = list(enumerate(workbook.dashboards))
         dashboard_slugs = unique_slugs(
-            (dashboard.name, dashboard.name) for dashboard in workbook.dashboards
+            (str(index), dashboard.name)
+            for index, dashboard in dashboard_entries
         )
         dashboard_ids = {
-            dashboard.name: f"dashboard:{workbook_slug}:{dashboard_slugs[dashboard.name]}"
-            for dashboard in workbook.dashboards
+            index: f"dashboard:{workbook_slug}:{dashboard_slugs[str(index)]}"
+            for index, _ in dashboard_entries
         }
 
-        for dashboard in sorted(
-            workbook.dashboards, key=lambda value: value.name.casefold()
+        for dashboard_index, dashboard in sorted(
+            dashboard_entries,
+            key=lambda value: (value[1].name.casefold(), value[0]),
         ):
-            dashboard_id = dashboard_ids[dashboard.name]
+            dashboard_id = dashboard_ids[dashboard_index]
+            normalized_layout: dict[str, object] | None = None
+            if dashboard.layout is not None:
+                normalized_layout = {
+                    key: value
+                    for key, value in dashboard.layout.items()
+                    if key not in {"items", "warnings"}
+                }
+                layout_warnings = list(dashboard.layout.get("warnings", []))
+                layout_items: list[dict[str, object]] = []
+                for raw_item in dashboard.layout.get("items", []):
+                    if not isinstance(raw_item, dict):
+                        continue
+                    item = dict(raw_item)
+                    worksheet_name = item.pop("worksheet_name", None)
+                    if worksheet_name is not None:
+                        matching_indices = worksheet_indices_by_name.get(
+                            str(worksheet_name), []
+                        )
+                        if len(matching_indices) != 1:
+                            layout_warnings.append(
+                                f"Skipped layout zone with ambiguous worksheet {worksheet_name!r}."
+                            )
+                            continue
+                        item["visual_id"] = visual_ids[matching_indices[0]]
+                    layout_items.append(item)
+                if layout_warnings and normalized_layout.get("status") == "complete":
+                    normalized_layout["status"] = "partial"
+                normalized_layout["items"] = layout_items
+                normalized_layout["warnings"] = layout_warnings
             entities.append(
                 _entity(
                     dashboard_id,
@@ -921,17 +1272,30 @@ def normalized_knowledge_payload(workbooks: list[Workbook]) -> dict[str, object]
                     source_id,
                     "dashboard",
                     dashboard.name,
+                    {"layout": normalized_layout} if normalized_layout else None,
                 )
             )
             dashboard_datasources: set[str] = set()
             for worksheet_name in dashboard.worksheets:
-                visual_id = visual_ids.get(worksheet_name)
-                if visual_id is None:
-                    continue
-                relations.append(_relation(dashboard_id, "contains", visual_id))
-                worksheet = next(
-                    item for item in workbook.worksheets if item.name == worksheet_name
+                matching_indices = worksheet_indices_by_name.get(
+                    worksheet_name, []
                 )
+                if len(matching_indices) != 1:
+                    if matching_indices:
+                        warnings.append(
+                            {
+                                "source_id": source_id,
+                                "message": (
+                                    f"Dashboard {dashboard.name!r} references "
+                                    f"ambiguous worksheet name {worksheet_name!r}."
+                                ),
+                            }
+                        )
+                    continue
+                worksheet_index = matching_indices[0]
+                visual_id = visual_ids[worksheet_index]
+                relations.append(_relation(dashboard_id, "contains", visual_id))
+                worksheet = workbook.worksheets[worksheet_index]
                 for field_key_value in worksheet_relevant_fields(
                     worksheet, workbook.fields
                 ):
@@ -944,10 +1308,12 @@ def normalized_knowledge_payload(workbooks: list[Workbook]) -> dict[str, object]
                     _relation(dashboard_id, "depends_on", datasource_id, direct=False)
                 )
 
-        for worksheet in sorted(
-            workbook.worksheets, key=lambda value: value.name.casefold()
+        displayed_metric_keys: set[str] = set()
+        for worksheet_index, worksheet in sorted(
+            worksheet_entries,
+            key=lambda value: (value[1].name.casefold(), value[0]),
         ):
-            visual_id = visual_ids[worksheet.name]
+            visual_id = visual_ids[worksheet_index]
             entities.append(
                 _entity(
                     visual_id,
@@ -962,7 +1328,7 @@ def normalized_knowledge_payload(workbooks: list[Workbook]) -> dict[str, object]
             displayed_keys = {
                 usage.field_key
                 for usage in worksheet.field_usages
-                if usage.context not in {"filter", "groupfilter"}
+                if usage.context in DISPLAY_CONTEXTS
             }
             for key in sorted(worksheet.direct_fields):
                 if key not in included:
@@ -976,35 +1342,70 @@ def normalized_knowledge_payload(workbooks: list[Workbook]) -> dict[str, object]
                     relations.append(
                         _relation(visual_id, "displays", metric_ids[key])
                     )
+                    displayed_metric_keys.add(key)
 
-            filter_labels = [
-                f"{item.field_label}-{index}"
-                for index, item in enumerate(worksheet.filters, start=1)
-            ]
-            filter_slugs = unique_slugs(
-                (str(index), label) for index, label in enumerate(filter_labels)
-            )
-            for index, item in enumerate(worksheet.filters):
-                filter_id = (
-                    f"filter:{workbook_slug}:{worksheet_slugs[worksheet.name]}:"
-                    f"{filter_slugs[str(index)]}"
-                )
-                entities.append(
-                    _entity(
-                        filter_id,
-                        "filter",
-                        item.field_label,
-                        source_id,
-                        "filter",
-                        item.raw_reference,
-                        {"operator": item.operator, "value": item.value},
+            for item in worksheet.filters:
+                if is_ignored_filter(item, workbook.fields):
+                    continue
+                signature = filter_signature(item)
+                filter_id = filter_ids[signature]
+                if signature not in emitted_filters:
+                    emitted_filters.add(signature)
+                    entities.append(
+                        _entity(
+                            filter_id,
+                            "filter",
+                            item.field_label,
+                            source_id,
+                            "filter",
+                            item.raw_reference,
+                            {"operator": item.operator, "value": item.value},
+                        )
                     )
-                )
                 relations.append(_relation(visual_id, "affected_by", filter_id))
                 if item.field_key in field_ids:
                     relations.append(
                         _relation(filter_id, "filters_on", field_ids[item.field_key])
                     )
+
+        for key in sorted(displayed_metric_keys, key=lambda value: metric_ids[value]):
+            item = workbook.fields[key]
+            attributes = inferred_rule_attributes(item)
+            if attributes is None or key not in calculation_ids:
+                continue
+            calculation_id = calculation_ids[key]
+            rule_id = (
+                f"business-rule:{workbook_slug}:{field_slugs[key]}-inferred"
+            )
+            attributes["evidence_calculation_ids"] = [calculation_id]
+            entities.append(
+                _entity(
+                    rule_id,
+                    "business_rule",
+                    f"{item.caption} rule",
+                    source_id,
+                    "inferred_business_rule",
+                    item.internal_name,
+                    attributes,
+                )
+            )
+            relations.append(
+                _relation(metric_ids[key], "affected_by", rule_id, direct=False)
+            )
+            relations.append(
+                _relation(rule_id, "implemented_by", calculation_id, direct=False)
+            )
+            for dependency in item.dependencies:
+                if dependency not in included:
+                    continue
+                relations.append(
+                    _relation(
+                        rule_id,
+                        "depends_on",
+                        calculation_ids.get(dependency, field_ids[dependency]),
+                        direct=False,
+                    )
+                )
 
     for matching_fields in published_fields.values():
         ordered = sorted(set(matching_fields))
@@ -1031,6 +1432,87 @@ def normalized_knowledge_payload(workbooks: list[Workbook]) -> dict[str, object]
         "relations": relations,
         "warnings": warnings,
     }
+
+
+def write_json_atomic(path: Path, payload: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = path.with_name(f".{path.name}.tmp")
+    temporary_path.write_text(
+        json.dumps(payload, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    temporary_path.replace(path)
+
+
+def tableau_source_filename(source_id: str) -> str:
+    prefix = "tableau-workbook:"
+    identifier = source_id[len(prefix) :] if source_id.startswith(prefix) else source_id
+    return f"{slugify(identifier, 'workbook')}.json"
+
+
+def migrate_legacy_tableau_source(output_root: Path) -> None:
+    """Split the former aggregate Tableau source without losing other workbooks."""
+    legacy_path = output_root / "sources" / "tableau.json"
+    if not legacy_path.exists():
+        return
+    try:
+        payload = json.loads(legacy_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise CatalogError(f"Cannot migrate legacy Tableau source: {exc}") from exc
+    if (
+        not isinstance(payload, dict)
+        or payload.get("schema_version") != SCHEMA_VERSION
+        or payload.get("source_type") != "tableau"
+    ):
+        raise CatalogError(
+            f"Cannot migrate incompatible legacy Tableau source: {legacy_path}"
+        )
+
+    entities = [
+        item for item in payload.get("entities", []) if isinstance(item, dict)
+    ]
+    relations = [
+        item for item in payload.get("relations", []) if isinstance(item, dict)
+    ]
+    warnings = [
+        item for item in payload.get("warnings", []) if isinstance(item, dict)
+    ]
+    tableau_dir = output_root / "sources" / "tableau"
+    for source in payload.get("sources", []):
+        if not isinstance(source, dict) or not isinstance(source.get("id"), str):
+            raise CatalogError(
+                f"Cannot migrate malformed Tableau source entry: {legacy_path}"
+            )
+        source_id = str(source["id"])
+        source_entities = [
+            item
+            for item in entities
+            if item.get("provenance", {}).get("source_id") == source_id
+        ]
+        source_entity_ids = {str(item["id"]) for item in source_entities}
+        source_relations = [
+            item
+            for item in relations
+            if item.get("from") in source_entity_ids
+            and item.get("to") in source_entity_ids
+        ]
+        source_warnings = [
+            item for item in warnings if item.get("source_id") == source_id
+        ]
+        target = tableau_dir / tableau_source_filename(source_id)
+        if not target.exists():
+            write_json_atomic(
+                target,
+                {
+                    "schema_version": SCHEMA_VERSION,
+                    "source_type": "tableau",
+                    "sources": [source],
+                    "entities": source_entities,
+                    "relations": source_relations,
+                    "warnings": source_warnings,
+                },
+            )
+    legacy_path.unlink()
 
 
 def build_argument_parser() -> argparse.ArgumentParser:
@@ -1066,22 +1548,16 @@ def run(args: argparse.Namespace) -> int:
                 raise
             failures.append(f"{source.name}: {exc}")
     if workbooks:
-        sources_dir = args.output / "sources"
-        sources_dir.mkdir(parents=True, exist_ok=True)
-        output_path = sources_dir / "tableau.json"
-        temporary_path = sources_dir / ".tableau.json.tmp"
-        temporary_path.write_text(
-            json.dumps(
-                normalized_knowledge_payload(workbooks),
-                indent=2,
-                ensure_ascii=False,
+        migrate_legacy_tableau_source(args.output)
+        tableau_dir = args.output / "sources" / "tableau"
+        for workbook in workbooks:
+            payload = normalized_knowledge_payload([workbook])
+            source_id = str(payload["sources"][0]["id"])
+            write_json_atomic(
+                tableau_dir / tableau_source_filename(source_id), payload
             )
-            + "\n",
-            encoding="utf-8",
-        )
-        temporary_path.replace(output_path)
     print(f"Processed workbooks: {len(workbooks)}")
-    print(f"Output: {(args.output / 'sources' / 'tableau.json').resolve()}")
+    print(f"Output: {(args.output / 'sources' / 'tableau').resolve()}")
     if failures:
         print("Warnings:", file=sys.stderr)
         for failure in failures:
