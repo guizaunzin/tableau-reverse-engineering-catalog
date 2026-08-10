@@ -67,12 +67,58 @@ class KnowledgeIndex:
 
     def _compact(self, entity: dict[str, Any]) -> dict[str, Any]:
         source_id = str(entity.get("provenance", {}).get("source_id") or "")
-        return {
+        result: dict[str, Any] = {
             "id": str(entity["id"]),
             "type": str(entity["type"]),
             "name": str(entity["name"]),
             "workbook": self.workbook_names.get(source_id),
         }
+        if entity["type"] in {"field", "calculation"}:
+            result["datasources"] = [
+                {
+                    "id": str(datasource["id"]),
+                    "name": str(datasource["name"]),
+                }
+                for datasource in self._datasources_for(entity)
+            ]
+        if entity["type"] == "calculation":
+            attributes = entity.get("attributes", {})
+            formula = attributes.get("formula_display") or attributes.get(
+                "formula_tableau"
+            )
+            if formula:
+                normalized = " ".join(str(formula).split())
+                result["formula_preview"] = (
+                    normalized
+                    if len(normalized) <= 200
+                    else f"{normalized[:197]}..."
+                )
+        return result
+
+    def _datasources_for(
+        self, entity: dict[str, Any]
+    ) -> list[dict[str, Any]]:
+        field_ids: list[str] = []
+        if entity["type"] == "field":
+            field_ids.append(str(entity["id"]))
+        elif entity["type"] == "calculation":
+            field_ids.extend(
+                str(relation["from"])
+                for relation in self.incoming.get(str(entity["id"]), [])
+                if relation["type"] == "calculated_by"
+                and self.entities_by_id[str(relation["from"])]["type"] == "field"
+            )
+        datasource_ids = {
+            str(relation["to"])
+            for field_id in field_ids
+            for relation in self.outgoing.get(field_id, [])
+            if relation["type"] == "comes_from"
+            and self.entities_by_id[str(relation["to"])]["type"] == "datasource"
+        }
+        return sorted(
+            (self.entities_by_id[item] for item in datasource_ids),
+            key=lambda item: (str(item["name"]).casefold(), str(item["id"])),
+        )
 
     @staticmethod
     def _limit(value: int) -> int:
@@ -128,11 +174,28 @@ class KnowledgeIndex:
                 str(item["id"]),
             )
         )
+        exact_groups: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        for item in matches:
+            exact_groups.setdefault(
+                (str(item["type"]), str(item["name"]).casefold()), []
+            ).append(item)
+        ambiguity_groups = [
+            {
+                "type": entity_type_value,
+                "name": group[0]["name"],
+                "entity_ids": [item["id"] for item in group],
+                "reason": "Multiple exact-name matches",
+            }
+            for (entity_type_value, _), group in sorted(exact_groups.items())
+            if len(group) > 1
+        ]
         return {
             "query": query,
             "count": min(len(matches), limit),
             "total_matches": len(matches),
             "truncated": len(matches) > limit,
+            "ambiguous": bool(ambiguity_groups),
+            "ambiguity_groups": ambiguity_groups,
             "results": matches[:limit],
         }
 
@@ -196,16 +259,40 @@ class KnowledgeIndex:
         }
 
     def impact_analysis(
-        self, entity_id: str, max_depth: int = 3
+        self, entity_ids: list[str], max_depth: int = 3
     ) -> dict[str, Any]:
-        entity = self._require_entity(entity_id)
-        impacted = analyze_impact(
-            self.model, entity_id, max_depth=self._depth(max_depth)
-        )
+        if not entity_ids or not all(isinstance(item, str) for item in entity_ids):
+            raise KnowledgeMcpError("entity_ids must be a non-empty list of IDs")
+        starting_ids = list(dict.fromkeys(entity_ids))
+        starting_entities = [self._require_entity(item) for item in starting_ids]
+        depth = self._depth(max_depth)
+        reached_from: dict[str, set[str]] = {}
+        impacted_order: list[str] = []
+        starting_set = set(starting_ids)
+        for starting_id in starting_ids:
+            for impacted_id in analyze_impact(
+                self.model, starting_id, max_depth=depth
+            ):
+                if impacted_id in starting_set:
+                    continue
+                if impacted_id not in reached_from:
+                    reached_from[impacted_id] = set()
+                    impacted_order.append(impacted_id)
+                reached_from[impacted_id].add(starting_id)
         return {
-            "entity": self._compact(entity),
+            "starting_entities": [
+                self._compact(entity) for entity in starting_entities
+            ],
             "impacted_entities": [
-                self._compact(self.entities_by_id[item]) for item in impacted
+                {
+                    **self._compact(self.entities_by_id[item]),
+                    "reached_from": [
+                        starting_id
+                        for starting_id in starting_ids
+                        if starting_id in reached_from[item]
+                    ],
+                }
+                for item in impacted_order
             ],
         }
 
@@ -263,7 +350,11 @@ def create_mcp_server(index: KnowledgeIndex) -> Any:
         workbook: str | None = None,
         limit: int = 10,
     ) -> dict[str, Any]:
-        """Search entities by text, optional type, and optional workbook."""
+        """Search entities by text, type, and workbook.
+
+        Do not choose arbitrarily when ambiguous is true. Pass every relevant
+        exact-match ID to impact_analysis or ask the user to select.
+        """
         return index.search_entities(
             query,
             entity_type=entity_type,
@@ -290,10 +381,14 @@ def create_mcp_server(index: KnowledgeIndex) -> Any:
 
     @server.tool()
     def impact_analysis(
-        entity_id: str, max_depth: int = 3
+        entity_ids: list[str], max_depth: int = 3
     ) -> dict[str, Any]:
-        """Trace bounded downstream entities potentially affected by a change."""
-        return index.impact_analysis(entity_id, max_depth=max_depth)
+        """Trace downstream impact for one or more starting entity IDs.
+
+        Pass all candidates from a relevant search ambiguity group. Results
+        are deduplicated and retain their starting IDs in reached_from.
+        """
+        return index.impact_analysis(entity_ids, max_depth=max_depth)
 
     @server.tool()
     def find_business_rules(
