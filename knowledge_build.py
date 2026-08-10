@@ -504,6 +504,60 @@ def _append_index_chips(
         lines.append(" ".join(chips[offset : offset + 8]))
 
 
+def _append_grouped_visuals(
+    lines: list[str],
+    markdown_root: Path,
+    model: dict[str, Any],
+    visuals: list[dict[str, Any]],
+) -> None:
+    entities = {str(entity["id"]): entity for entity in model["entities"]}
+    outgoing, _ = _relation_index(model)
+    dashboards = sorted(
+        (
+            entity
+            for entity in model["entities"]
+            if entity["type"] == "dashboard"
+        ),
+        key=lambda item: (str(item["name"]).casefold(), str(item["id"])),
+    )
+    grouped: list[tuple[dict[str, Any], list[dict[str, Any]]]] = []
+    dashboard_counts: dict[str, int] = {}
+    assigned: set[str] = set()
+    for dashboard in dashboards:
+        dashboard_visuals = _dashboard_visuals(dashboard, entities, outgoing)
+        if not dashboard_visuals:
+            continue
+        grouped.append((dashboard, dashboard_visuals))
+        for visual in dashboard_visuals:
+            visual_id = str(visual["id"])
+            assigned.add(visual_id)
+            dashboard_counts[visual_id] = dashboard_counts.get(visual_id, 0) + 1
+
+    for dashboard, dashboard_visuals in grouped:
+        href, label = _index_href(markdown_root, dashboard)
+        lines.append(f"### [{label}]({href})")
+        lines.append("")
+        for visual in dashboard_visuals:
+            visual_href, visual_label = _index_href(markdown_root, visual)
+            shared_count = dashboard_counts[str(visual["id"])]
+            shared = (
+                f" — <sub>Shared across {shared_count} dashboards</sub>"
+                if shared_count > 1
+                else ""
+            )
+            lines.append(f"- [{visual_label}]({visual_href}){shared}")
+        lines.append("")
+
+    unassigned = [
+        visual for visual in visuals if str(visual["id"]) not in assigned
+    ]
+    if unassigned:
+        lines.extend(["### Unassigned Visuals", ""])
+        for visual in unassigned:
+            href, label = _index_href(markdown_root, visual)
+            lines.append(f"- [{label}]({href})")
+
+
 def _render_index(
     markdown_root: Path, model: dict[str, Any], title: str
 ) -> None:
@@ -518,6 +572,7 @@ def _render_index(
                 entity
                 for entity in model["entities"]
                 if entity["type"] == entity_type
+                and (entity_type != "field" or _is_human_field(entity))
             ),
             key=lambda item: (str(item["name"]).casefold(), str(item["id"])),
         )
@@ -534,6 +589,8 @@ def _render_index(
             continue
         if entity_type == "dashboard":
             _append_dashboard_cards(lines, markdown_root, matching)
+        elif entity_type == "visual":
+            _append_grouped_visuals(lines, markdown_root, model, matching)
         elif entity_type in CHIP_INDEX_TYPES:
             _append_index_chips(lines, markdown_root, matching)
         else:
@@ -634,8 +691,6 @@ def _entity_link(
     markdown_root: Path,
     current: dict[str, Any],
     target: dict[str, Any],
-    *,
-    anchor: str | None = None,
 ) -> str:
     target_path = _page_path(markdown_root, target)
     current_path = _page_path(markdown_root, current)
@@ -643,8 +698,6 @@ def _entity_link(
     if current_path.parent == target_path.parent:
         relative = Path(target_path.name)
     href = relative.as_posix()
-    if anchor:
-        href = f"{href}#{anchor}"
     entity_type = str(target["type"])
     if entity_type in PILL_STYLES:
         return _pill_html(
@@ -710,6 +763,15 @@ def _sorted_entities(
     )
 
 
+def _is_human_field(entity: dict[str, Any]) -> bool:
+    """Keep calculated fields in the model, but out of human field inventories."""
+    attributes = entity.get("attributes", {})
+    if not isinstance(attributes, dict):
+        return True
+    field_type = str(attributes.get("field_type") or "").casefold()
+    return field_type not in {"calculated", "parameter"}
+
+
 def _visual_contents(
     visual_id: str,
     entities: dict[str, dict[str, Any]],
@@ -737,7 +799,7 @@ def _visual_contents(
     documented_fields = [
         item
         for item in by_type["field"]
-        if item.get("attributes", {}).get("field_type") != "Parameter"
+        if _is_human_field(item)
     ]
     datasource_ids = {
         str(relation["to"])
@@ -908,9 +970,8 @@ def _append_dashboard_visuals(
             items = contents[entity_type]
             if entity_type == "field":
                 items = sorted(
-                    items,
+                    (item for item in items if _is_human_field(item)),
                     key=lambda item: (
-                        item.get("attributes", {}).get("field_type") == "Parameter",
                         str(item["name"]).casefold(),
                     ),
                 )
@@ -1096,11 +1157,7 @@ def _append_visual_dictionary(
     else:
         lines.append("No metrics identified.")
 
-    fields = [
-        item
-        for item in contents["field"]
-        if item.get("attributes", {}).get("field_type") != "Parameter"
-    ]
+    fields = [item for item in contents["field"] if _is_human_field(item)]
     lines.extend(["", "## Fields", ""])
     if fields:
         lines.extend(["| Field | Type | Role | Data Source |", "|---|---|---|---|"])
@@ -1162,12 +1219,37 @@ def _append_visual_dictionary(
 
 
 def _append_calculation_formula(
-    lines: list[str], calculation: dict[str, Any]
+    lines: list[str],
+    calculation: dict[str, Any],
+    markdown_root: Path,
+    entities: dict[str, dict[str, Any]],
+    outgoing: dict[str, list[dict[str, Any]]],
 ) -> None:
-    formula = calculation.get("attributes", {}).get("formula_tableau")
+    attributes = calculation.get("attributes", {})
+    formula = attributes.get("formula_display") or attributes.get("formula_tableau")
     if not formula:
         return
-    lines.extend(["", "## Formula", "", "```text", str(formula), "```"])
+    targets_by_name: dict[str, dict[str, Any]] = {}
+    for relation in outgoing.get(str(calculation["id"]), []):
+        if relation["type"] != "depends_on":
+            continue
+        target = entities.get(str(relation["to"]))
+        if target is not None and target["type"] in {"field", "calculation"}:
+            targets_by_name.setdefault(str(target["name"]).casefold(), target)
+
+    formula_text = str(formula)
+    rendered: list[str] = []
+    cursor = 0
+    for match in re.finditer(r"\[([^\]]+)\]", formula_text):
+        rendered.append(html.escape(formula_text[cursor : match.start()]))
+        target = targets_by_name.get(match.group(1).casefold())
+        if target is None:
+            rendered.append(html.escape(match.group(0)))
+        else:
+            rendered.append(_entity_link(markdown_root, calculation, target))
+        cursor = match.end()
+    rendered.append(html.escape(formula_text[cursor:]))
+    lines.extend(["", "## Formula", "", f"<pre><code>{''.join(rendered)}</code></pre>"])
 
 
 def _append_inferred_rule(
@@ -1254,7 +1336,7 @@ def _append_standard_sections(
             target = entities[relation["to"]]
             lines.append(
                 f"- {relation['type']} → "
-                f"{_entity_link(markdown_root, entity, target, anchor='top')}"
+                f"{_entity_link(markdown_root, entity, target)}"
             )
     reverse_relations = incoming.get(str(entity["id"]), [])
     if reverse_relations:
@@ -1263,7 +1345,7 @@ def _append_standard_sections(
             source = entities[relation["from"]]
             lines.append(
                 f"- {relation['type']} ← "
-                f"{_entity_link(markdown_root, entity, source, anchor='top')}"
+                f"{_entity_link(markdown_root, entity, source)}"
             )
     manual = entity.get("manual") or {}
     manual_body = str(entity.get("manual_body") or "").strip()
@@ -1291,10 +1373,7 @@ def _render_workbook_pages(
         back_label = (
             str(title).replace("[", "\\[").replace("]", "\\]")
         )
-        lines = [
-            f'# {page_title}<a id="top"></a>\n\n'
-            f"[← Back to {back_label}](../README.md)"
-        ]
+        lines = [f"# {page_title}\n\n[← Back to {back_label}](../README.md)"]
         if entity["type"] == "dashboard":
             _append_dashboard_header(lines, entity)
             _append_summary(lines, entity, entities, outgoing)
@@ -1312,7 +1391,9 @@ def _render_workbook_pages(
                 lines, entity, markdown_root, entities, outgoing, incoming
             )
         elif entity["type"] == "calculation":
-            _append_calculation_formula(lines, entity)
+            _append_calculation_formula(
+                lines, entity, markdown_root, entities, outgoing
+            )
         elif entity["type"] == "business_rule":
             _append_inferred_rule(lines, entity, markdown_root, entities)
         _append_standard_sections(
