@@ -298,11 +298,12 @@ def add_repeated_calculations(root: Path) -> None:
 
 
 class KnowledgeMcpCliTests(unittest.TestCase):
-    def test_mcp_requirements_include_the_knowledge_loader_dependency(self) -> None:
+    def test_mcp_requirements_pin_v1_and_include_loader_dependency(self) -> None:
         requirements = (PROJECT_ROOT / "requirements-mcp.txt").read_text(
             encoding="utf-8"
         )
 
+        self.assertIn("mcp>=1.28,<2", requirements)
         self.assertIn("PyYAML", requirements)
 
     def test_check_loads_the_v2_knowledge_base_without_starting_mcp(self) -> None:
@@ -349,20 +350,48 @@ class KnowledgeMcpCliTests(unittest.TestCase):
                         self.assertEqual(
                             {tool.name for tool in tools.tools},
                             {
-                                "describe_entity",
-                                "find_business_rules",
-                                "impact_analysis",
-                                "search_entities",
-                                "show_dependencies",
-                                "where_is_used",
+                                "knowledge_analyze_impact",
+                                "knowledge_describe_entity",
+                                "knowledge_find_business_rules",
+                                "knowledge_search_entities",
+                                "knowledge_show_dependencies",
+                                "knowledge_where_is_used",
                             },
                         )
+                        for tool in tools.tools:
+                            self.assertIsNotNone(tool.annotations)
+                            self.assertTrue(tool.annotations.readOnlyHint)
+                            self.assertFalse(tool.annotations.destructiveHint)
+                            self.assertTrue(tool.annotations.idempotentHint)
+                            self.assertFalse(tool.annotations.openWorldHint)
+
+                        search_tool = next(
+                            tool
+                            for tool in tools.tools
+                            if tool.name == "knowledge_search_entities"
+                        )
+                        self.assertIn(
+                            "offset", search_tool.inputSchema["properties"]
+                        )
+                        self.assertIsNotNone(search_tool.outputSchema)
+
                         result = await session.call_tool(
-                            "search_entities",
+                            "knowledge_search_entities",
                             {"query": "revenue", "entity_type": "metric"},
                         )
                         self.assertFalse(result.isError)
                         self.assertIn("metric:sales:revenue", str(result.content))
+                        self.assertEqual(
+                            result.structuredContent["results"][0]["id"],
+                            "metric:sales:revenue",
+                        )
+
+                        error = await session.call_tool(
+                            "knowledge_describe_entity",
+                            {"entity_id": "metric:sales:missing"},
+                        )
+                        self.assertTrue(error.isError)
+                        self.assertIn("Entity not found", str(error.content))
 
             asyncio.run(scenario())
 
@@ -475,6 +504,54 @@ class KnowledgeIndexTests(unittest.TestCase):
             {item["formula_preview"] for item in result["results"]},
             {"SUM([Revenue])"},
         )
+
+    def test_search_paginates_results_and_reports_the_next_offset(self) -> None:
+        add_repeated_calculations(self.root)
+
+        result = self.index().search_entities(
+            "Revenue YTD",
+            entity_type="calculation",
+            offset=1,
+            limit=1,
+        )
+
+        self.assertEqual(result["count"], 1)
+        self.assertEqual(result["total_matches"], 3)
+        self.assertTrue(result["has_more"])
+        self.assertEqual(result["next_offset"], 2)
+        self.assertEqual(
+            result["results"][0]["id"],
+            "calculation:sales:revenue-ytd-2",
+        )
+
+    def test_query_validation_rejects_invalid_inputs(self) -> None:
+        index = self.index()
+
+        with self.assertRaisesRegex(
+            knowledge_mcp.KnowledgeMcpError,
+            "limit must be between 1 and 100",
+        ):
+            index.search_entities("revenue", limit=0)
+        with self.assertRaisesRegex(
+            knowledge_mcp.KnowledgeMcpError,
+            "offset must be zero or greater",
+        ):
+            index.search_entities("revenue", offset=-1)
+        with self.assertRaisesRegex(
+            knowledge_mcp.KnowledgeMcpError,
+            "Unsupported entity type",
+        ):
+            index.search_entities("revenue", entity_type="unknown")
+        with self.assertRaisesRegex(
+            knowledge_mcp.KnowledgeMcpError,
+            "max_depth must be between 1 and 10",
+        ):
+            index.show_dependencies("metric:sales:revenue", max_depth=0)
+        with self.assertRaisesRegex(
+            knowledge_mcp.KnowledgeMcpError,
+            "Entity not found",
+        ):
+            index.describe_entity("metric:sales:missing")
 
     def test_impact_analysis_unions_multiple_starting_entities(self) -> None:
         add_repeated_calculations(self.root)

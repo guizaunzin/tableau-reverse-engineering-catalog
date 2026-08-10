@@ -259,18 +259,23 @@ Start the stdio server manually when testing an MCP client:
 python knowledge_mcp.py knowledge
 ```
 
-The server loads the complete schema-v2 model once at startup and exposes six
-read-only tools: `search_entities`, `describe_entity`, `where_is_used`,
-`show_dependencies`, `impact_analysis`, and `find_business_rules`. Restart it
-after changing generated sources or manual pages.
+The `knowledge_mcp` server loads the complete schema-v2 model once at startup
+and exposes six read-only tools: `knowledge_search_entities`,
+`knowledge_describe_entity`, `knowledge_where_is_used`,
+`knowledge_show_dependencies`, `knowledge_analyze_impact`, and
+`knowledge_find_business_rules`. These prefixed names replace the former
+unprefixed tool names. Restart the server after changing generated sources or
+manual pages.
 
-When an exact name exists more than once, `search_entities` returns every
-occurrence with its datasource context and, for calculations, a formula
-preview. The response sets `ambiguous: true` and groups the matching IDs in
-`ambiguity_groups`; clients should not silently choose the first result.
-`impact_analysis` therefore accepts an `entity_ids` list, combines the impact
-of all selected occurrences, removes duplicates, and reports which starting
-IDs reached each impacted entity in `reached_from`.
+Search tools accept `offset` and `limit` and return `has_more` and
+`next_offset` alongside the total match count. When an exact name exists more
+than once, `knowledge_search_entities` returns each occurrence with its
+datasource context and, for calculations, a formula preview. The response sets
+`ambiguous: true` and groups the matching IDs in `ambiguity_groups`; clients
+should not silently choose the first result. `knowledge_analyze_impact`
+therefore accepts an `entity_ids` list, combines the impact of all selected
+occurrences, removes duplicates, and reports which starting IDs reached each
+impacted entity in `reached_from`.
 
 Roo Code supports global `mcp_settings.json` and project-level `.roo/mcp.json`
 configuration. Use absolute paths so the extension does not depend on the
