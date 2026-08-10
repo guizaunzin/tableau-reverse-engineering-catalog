@@ -6,7 +6,8 @@ Tableau is a source of evidence, not the final documentation format.
 
 The MVP deliberately uses JSON, Markdown, YAML front matter, and plain Python.
 It has no database, graph database, vector database, Tableau Server connection,
-Confluence synchronization, or active MCP integration.
+or Confluence synchronization. A local read-only MCP server exposes the same
+Knowledge Base to agents without querying Tableau again.
 
 ## Data flow
 
@@ -16,15 +17,15 @@ TWB/TWBX
 tableau_doc.py
    ↓
 knowledge/sources/tableau/*.json ──┐
-                                  ├─ knowledge_build.py
+                                  ├─ knowledge_build.py → Markdown
 knowledge/manual/**/*.md ─────────┘
-                                      ↓
-                       knowledge/markdown/workbooks/
+                                  └─ knowledge_mcp.py → agents
 ```
 
 `tableau_doc.py` is only a Tableau metadata extractor and normalizer.
 `knowledge_build.py` validates the complete file-based model, provides simple
 dependency/impact functions, and renders disposable Markdown pages.
+`knowledge_mcp.py` provides read-only semantic search and relation traversal.
 
 ## Install
 
@@ -205,9 +206,9 @@ violet for Calculations, blue for Filters, and gray for Fields. Styles are
 inline so every Markdown file remains self-contained and requires no shared CSS
 or external assets. Generated pages with two or more level-two sections receive
 a Contents index at the top.
-Every entity page also exposes a `top` anchor and a backlink to its workbook
-README. Relationship and reverse-usage links target that anchor explicitly so
-navigation never reuses a previous scroll position near the end of the page.
+Every entity page also exposes a backlink to its workbook README. Relationship
+and reverse-usage links target the Markdown file directly for compatibility
+with VS Code and other Markdown viewers.
 
 Dashboard pages additionally contain:
 
@@ -221,19 +222,72 @@ Dashboard pages additionally contain:
 - when Tableau exposes a valid fixed desktop layout, a proportional SVG
   wireframe in that workbook's `assets/layouts` directory.
 
-Visual pages act as a data dictionary and list their dashboards, metrics,
-fields, directly used calculations, filters, and data sources. Entity names
-link to their dedicated pages. Parameters remain in the normalized dependency
-model but are intentionally omitted from individual Visual pages because they
-are workbook-scoped. Metric business definitions appear only when human
-metadata supplies one, and complete Tableau formulas are rendered as code on
-the dedicated Calculation pages. The numbering in a dashboard's Visuals
-inventory matches its SVG wireframe.
+Visual pages act as a data dictionary and list their dashboards, metrics, base
+fields, directly used calculations, filters, and data sources. Calculated
+Fields remain in the semantic model but are omitted from human Field inventories
+because their dedicated Calculation entity represents the logic. Parameters
+also remain in the dependency model but are omitted from individual Visual
+pages because they are workbook-scoped. Calculation pages prefer the readable
+`formula_display` and turn resolved Field and Calculation references into
+color-coded links. The numbering in a dashboard's Visuals inventory matches its
+SVG wireframe.
 
 Layout metadata remains embedded in the automatic Dashboard entity rather
 than becoming a separate entity hierarchy. It stores the Tableau coordinate
 space, fixed dashboard size, drawable items, and extraction warnings. SVG
 files and all Markdown remain disposable builder output.
+
+## Serve the Knowledge Base over MCP
+
+Create a dedicated environment and install the local MCP dependencies:
+
+```bash
+python3 -m venv .venv-mcp
+source .venv-mcp/bin/activate
+pip install -r requirements-mcp.txt
+```
+
+Validate the Knowledge Base without starting a server:
+
+```bash
+python knowledge_mcp.py knowledge --check
+```
+
+Start the stdio server manually when testing an MCP client:
+
+```bash
+python knowledge_mcp.py knowledge
+```
+
+The server loads the complete schema-v2 model once at startup and exposes six
+read-only tools: `search_entities`, `describe_entity`, `where_is_used`,
+`show_dependencies`, `impact_analysis`, and `find_business_rules`. Restart it
+after changing generated sources or manual pages.
+
+Roo Code supports global `mcp_settings.json` and project-level `.roo/mcp.json`
+configuration. Use absolute paths so the extension does not depend on the
+shell's working directory:
+
+```json
+{
+  "mcpServers": {
+    "tableau-knowledge": {
+      "command": "/absolute/path/to/project/.venv-mcp/bin/python",
+      "args": [
+        "/absolute/path/to/project/knowledge_mcp.py",
+        "/absolute/path/to/project/knowledge"
+      ],
+      "cwd": "/absolute/path/to/project",
+      "alwaysAllow": [],
+      "disabled": false
+    }
+  }
+}
+```
+
+On Windows, use the absolute `.venv-mcp\\Scripts\\python.exe` path as the
+`command`. Keeping `alwaysAllow` empty makes Roo Code ask before the first use
+of each tool.
 
 ## Safety and known limits
 
@@ -260,6 +314,7 @@ files and all Markdown remain disposable builder output.
 python3 -m unittest \
   tests.test_tableau_knowledge \
   tests.test_knowledge_build \
+  tests.test_knowledge_mcp \
   tests.test_analytics_core -v
 ```
 

@@ -6,6 +6,7 @@ docs/
 /tests/*
 !/tests/test_analytics_core.py
 !/tests/test_knowledge_build.py
+!/tests/test_knowledge_mcp.py
 !/tests/test_tableau_knowledge.py
 semantic_config.json
 semantic_config.draft.json
