@@ -261,6 +261,182 @@ description: Revenue is recognized after approval.
             expected_order,
         )
 
+    def test_groups_workbook_visuals_by_dashboard(self) -> None:
+        payload = source_payload()
+        payload["entities"].extend(
+            [
+                {
+                    "id": "dashboard:sales:executive",
+                    "type": "dashboard",
+                    "name": "Executive Dashboard",
+                    "provenance": {"source_id": "tableau-workbook:sales"},
+                    "attributes": {},
+                },
+                {
+                    "id": "dashboard:sales:regional",
+                    "type": "dashboard",
+                    "name": "Regional Dashboard",
+                    "provenance": {"source_id": "tableau-workbook:sales"},
+                    "attributes": {},
+                },
+                {
+                    "id": "visual:sales:regional",
+                    "type": "visual",
+                    "name": "Regional Sales",
+                    "provenance": {"source_id": "tableau-workbook:sales"},
+                    "attributes": {},
+                },
+                {
+                    "id": "visual:sales:shared-legend",
+                    "type": "visual",
+                    "name": "Shared Legend",
+                    "provenance": {"source_id": "tableau-workbook:sales"},
+                    "attributes": {},
+                },
+                {
+                    "id": "visual:sales:export",
+                    "type": "visual",
+                    "name": "Export Helper",
+                    "provenance": {"source_id": "tableau-workbook:sales"},
+                    "attributes": {},
+                },
+            ]
+        )
+        payload["relations"].extend(
+            [
+                {
+                    "from": "dashboard:sales:executive",
+                    "type": "contains",
+                    "to": "visual:sales:overview",
+                    "evidence": {"source": "tableau", "direct": True},
+                },
+                {
+                    "from": "dashboard:sales:executive",
+                    "type": "contains",
+                    "to": "visual:sales:shared-legend",
+                    "evidence": {"source": "tableau", "direct": True},
+                },
+                {
+                    "from": "dashboard:sales:regional",
+                    "type": "contains",
+                    "to": "visual:sales:regional",
+                    "evidence": {"source": "tableau", "direct": True},
+                },
+                {
+                    "from": "dashboard:sales:regional",
+                    "type": "contains",
+                    "to": "visual:sales:shared-legend",
+                    "evidence": {"source": "tableau", "direct": True},
+                },
+            ]
+        )
+        (self.root / "sources" / "tableau.json").write_text(
+            json.dumps(payload), encoding="utf-8"
+        )
+
+        result = self.run_builder()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        index = (workbook_markdown(self.root) / "README.md").read_text(
+            encoding="utf-8"
+        )
+        visuals = index[index.index("## Visuals") : index.index("## Metrics")]
+        self.assertIn(
+            "### [Executive Dashboard](dashboards/dashboard-sales-executive.md)",
+            visuals,
+        )
+        self.assertIn(
+            "### [Regional Dashboard](dashboards/dashboard-sales-regional.md)",
+            visuals,
+        )
+        self.assertEqual(
+            visuals.count("visuals/visual-sales-shared-legend.md"), 2
+        )
+        self.assertIn("Shared across 2 dashboards", visuals)
+        self.assertIn("### Unassigned Visuals", visuals)
+        self.assertIn(
+            "[Export Helper](visuals/visual-sales-export.md)", visuals
+        )
+
+    def test_keeps_calculated_fields_out_of_human_field_lists(self) -> None:
+        payload = source_payload()
+        payload["entities"].extend(
+            [
+                {
+                    "id": "field:sales:profit",
+                    "type": "field",
+                    "name": "Profit",
+                    "provenance": {"source_id": "tableau-workbook:sales"},
+                    "attributes": {"field_type": "Base field"},
+                },
+                {
+                    "id": "field:sales:profit-ratio",
+                    "type": "field",
+                    "name": "Profit Ratio",
+                    "provenance": {"source_id": "tableau-workbook:sales"},
+                    "attributes": {"field_type": "Calculated"},
+                },
+                {
+                    "id": "calculation:sales:profit-ratio",
+                    "type": "calculation",
+                    "name": "Profit Ratio",
+                    "provenance": {"source_id": "tableau-workbook:sales"},
+                    "attributes": {
+                        "formula_display": "[Profit] / [Revenue]"
+                    },
+                },
+            ]
+        )
+        payload["relations"].extend(
+            [
+                {
+                    "from": "visual:sales:overview",
+                    "type": "uses",
+                    "to": "field:sales:profit",
+                },
+                {
+                    "from": "visual:sales:overview",
+                    "type": "uses",
+                    "to": "field:sales:profit-ratio",
+                },
+                {
+                    "from": "visual:sales:overview",
+                    "type": "uses",
+                    "to": "calculation:sales:profit-ratio",
+                },
+            ]
+        )
+        (self.root / "sources" / "tableau.json").write_text(
+            json.dumps(payload), encoding="utf-8"
+        )
+
+        result = self.run_builder()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        index = (workbook_markdown(self.root) / "README.md").read_text(
+            encoding="utf-8"
+        )
+        calculation_index = index[
+            index.index("## Calculations") : index.index("## Filters")
+        ]
+        field_index = index[index.index("## Fields") :]
+        self.assertIn("Profit Ratio", calculation_index)
+        self.assertIn("Profit", field_index)
+        self.assertNotIn("Profit Ratio", field_index)
+
+        visual = (
+            workbook_markdown(self.root) / "visuals" / "visual-sales-overview.md"
+        ).read_text(encoding="utf-8")
+        field_section = visual[
+            visual.index("## Fields") : visual.index("## Calculations")
+        ]
+        calculation_section = visual[
+            visual.index("## Calculations") : visual.index("## Filters")
+        ]
+        self.assertIn("Profit", field_section)
+        self.assertNotIn("Profit Ratio", field_section)
+        self.assertIn("Profit Ratio", calculation_section)
+
     def test_renders_each_workbook_in_an_independent_markdown_tree(self) -> None:
         inventory = {
             "schema_version": 2,
@@ -386,7 +562,8 @@ description: Revenue is recognized after approval.
                     "provenance": {"source_id": "tableau-workbook:sales"},
                     "attributes": {
                         "classification": "Aggregate calculation",
-                        "formula_tableau": "IF [Revenue] > 0\nTHEN [Revenue]\nEND",
+                        "formula_tableau": "IF [Calculation_1001] > 0\nTHEN [Calculation_1001]\nEND",
+                        "formula_display": "IF [Revenue | YTD] > 0\nTHEN [Revenue | YTD]\nEND",
                     },
                 },
                 {
@@ -529,7 +706,7 @@ status: Production
             / "dashboards"
             / "dashboard-sales-executive.md"
         ).read_text(encoding="utf-8")
-        self.assertIn('<a id="top"></a>', dashboard)
+        self.assertNotIn('<a id="top"></a>', dashboard)
         self.assertIn("[← Back to Sales](../README.md)", dashboard)
         self.assertLess(
             dashboard.index("Sales health and regional performance."),
@@ -614,17 +791,25 @@ status: Production
             / "calculations"
             / "calculation-sales-revenue.md"
         ).read_text(encoding="utf-8")
-        self.assertIn('<a id="top"></a>', calculation)
+        self.assertNotIn('<a id="top"></a>', calculation)
         self.assertIn("[← Back to Sales](../README.md)", calculation)
         self.assertIn(
-            'depends_on → <a href="../fields/field-sales-revenue.md#top"',
+            'depends_on → <a href="../fields/field-sales-revenue.md"',
             calculation,
         )
         self.assertIn("## Formula", calculation)
+        formula_section = calculation[
+            calculation.index("## Formula") : calculation.index(
+                "## Automatic metadata"
+            )
+        ]
+        self.assertIn("IF ", formula_section)
+        self.assertIn("Revenue &#124; YTD", formula_section)
+        self.assertNotIn("Calculation_1001", formula_section)
         self.assertIn(
-            "```text\nIF [Revenue] > 0\nTHEN [Revenue]\nEND\n```",
-            calculation,
+            'href="../fields/field-sales-revenue.md"', formula_section
         )
+        self.assertIn('data-entity-type="field"', formula_section)
         rule = (
             workbook_markdown(self.root)
             / "business-rules"
