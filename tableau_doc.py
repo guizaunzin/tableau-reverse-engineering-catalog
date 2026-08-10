@@ -811,11 +811,16 @@ def detect_cycles(workbook: Workbook, included: set[str]) -> None:
 def unique_slugs(labels: Iterable[tuple[str, str]]) -> dict[str, str]:
     """Return stable, collision-safe slugs keyed by entity key."""
     result: dict[str, str] = {}
-    used: dict[str, int] = defaultdict(int)
+    used: set[str] = set()
     for key, label in sorted(labels, key=lambda item: (item[1].casefold(), item[0])):
         base = slugify(label)
-        used[base] += 1
-        result[key] = base if used[base] == 1 else f"{base}-{used[base]}"
+        candidate = base
+        suffix = 2
+        while candidate in used:
+            candidate = f"{base}-{suffix}"
+            suffix += 1
+        result[key] = candidate
+        used.add(candidate)
     return result
 
 
