@@ -615,6 +615,55 @@ class TableauKnowledgeCliTests(unittest.TestCase):
             )
             self.assertEqual(check.returncode, 0, check.stderr)
 
+    def test_repeated_datasource_fields_receive_globally_unique_ids(self) -> None:
+        workbook = """\
+        <workbook name="Repeated Data Sources">
+          <datasources>
+            <datasource name="source.one" caption="Orders">
+              <column name="[Revenue]" caption="Revenue" datatype="real" />
+              <column name="[Revenue_2]" caption="Revenue 2" datatype="real" />
+            </datasource>
+            <datasource name="source.two" caption="Orders">
+              <column name="[Revenue]" caption="Revenue" datatype="real" />
+              <column name="[Revenue_2]" caption="Revenue 2" datatype="real" />
+            </datasource>
+            <datasource name="source.three" caption="Orders">
+              <column name="[Revenue]" caption="Revenue" datatype="real" />
+              <column name="[Revenue_2]" caption="Revenue 2" datatype="real" />
+            </datasource>
+          </datasources>
+          <worksheets>
+            <worksheet name="One"><table><view><rows>[source.one].[Revenue] [source.one].[Revenue_2]</rows></view></table></worksheet>
+            <worksheet name="Two"><table><view><rows>[source.two].[Revenue] [source.two].[Revenue_2]</rows></view></table></worksheet>
+            <worksheet name="Three"><table><view><rows>[source.three].[Revenue] [source.three].[Revenue_2]</rows></view></table></worksheet>
+          </worksheets>
+        </workbook>
+        """
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "repeated-datasources.twb"
+            output = root / "knowledge"
+            source.write_text(textwrap.dedent(workbook), encoding="utf-8")
+
+            result = self.run_extractor(source, output)
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            payload = json.loads(
+                tableau_source(output, "repeated-data-sources").read_text(
+                    encoding="utf-8"
+                )
+            )
+            entity_ids = [item["id"] for item in payload["entities"]]
+            self.assertEqual(len(entity_ids), len(set(entity_ids)))
+            check = subprocess.run(
+                [sys.executable, str(BUILDER), str(output), "--check"],
+                cwd=PROJECT_ROOT,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(check.returncode, 0, check.stderr)
+
     def test_extracting_one_workbook_preserves_previous_workbook_sources(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
