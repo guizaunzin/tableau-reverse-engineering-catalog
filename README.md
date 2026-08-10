@@ -264,6 +264,14 @@ read-only tools: `search_entities`, `describe_entity`, `where_is_used`,
 `show_dependencies`, `impact_analysis`, and `find_business_rules`. Restart it
 after changing generated sources or manual pages.
 
+When an exact name exists more than once, `search_entities` returns every
+occurrence with its datasource context and, for calculations, a formula
+preview. The response sets `ambiguous: true` and groups the matching IDs in
+`ambiguity_groups`; clients should not silently choose the first result.
+`impact_analysis` therefore accepts an `entity_ids` list, combines the impact
+of all selected occurrences, removes duplicates, and reports which starting
+IDs reached each impacted entity in `reached_from`.
+
 Roo Code supports global `mcp_settings.json` and project-level `.roo/mcp.json`
 configuration. Use absolute paths so the extension does not depend on the
 shell's working directory:

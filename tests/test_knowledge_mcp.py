@@ -133,6 +133,170 @@ owner: Finance
     )
 
 
+def add_repeated_calculations(root: Path) -> None:
+    path = root / "sources" / "tableau" / "sales.json"
+    source = json.loads(path.read_text(encoding="utf-8"))
+    source["entities"].extend(
+        [
+            {
+                "id": f"datasource:sales:orders{suffix}",
+                "type": "datasource",
+                "name": "Orders",
+                "provenance": {"source_id": "tableau-workbook:sales"},
+                "attributes": {"internal_name": f"orders{suffix or '-1'}"},
+            }
+            for suffix in ("", "-2", "-3")
+        ]
+    )
+    source["entities"].extend(
+        [
+            {
+                "id": "field:sales:revenue-ytd",
+                "type": "field",
+                "name": "Revenue YTD",
+                "provenance": {"source_id": "tableau-workbook:sales"},
+                "attributes": {"field_type": "Calculated"},
+            },
+            {
+                "id": "field:sales:revenue-2",
+                "type": "field",
+                "name": "Revenue",
+                "provenance": {"source_id": "tableau-workbook:sales"},
+                "attributes": {"field_type": "Base field"},
+            },
+            {
+                "id": "field:sales:revenue-ytd-2",
+                "type": "field",
+                "name": "Revenue YTD",
+                "provenance": {"source_id": "tableau-workbook:sales"},
+                "attributes": {"field_type": "Calculated"},
+            },
+            {
+                "id": "calculation:sales:revenue-ytd-2",
+                "type": "calculation",
+                "name": "Revenue YTD",
+                "provenance": {"source_id": "tableau-workbook:sales"},
+                "attributes": {"formula_display": "SUM([Revenue])"},
+            },
+            {
+                "id": "visual:sales:revenue-card-2",
+                "type": "visual",
+                "name": "Revenue Card 2",
+                "provenance": {"source_id": "tableau-workbook:sales"},
+                "attributes": {},
+            },
+            {
+                "id": "field:sales:revenue-3",
+                "type": "field",
+                "name": "Revenue",
+                "provenance": {"source_id": "tableau-workbook:sales"},
+                "attributes": {"field_type": "Base field"},
+            },
+            {
+                "id": "field:sales:revenue-ytd-3",
+                "type": "field",
+                "name": "Revenue YTD",
+                "provenance": {"source_id": "tableau-workbook:sales"},
+                "attributes": {"field_type": "Calculated"},
+            },
+            {
+                "id": "calculation:sales:revenue-ytd-3",
+                "type": "calculation",
+                "name": "Revenue YTD",
+                "provenance": {"source_id": "tableau-workbook:sales"},
+                "attributes": {"formula_display": "SUM([Revenue])"},
+            },
+            {
+                "id": "visual:sales:revenue-card-3",
+                "type": "visual",
+                "name": "Revenue Card 3",
+                "provenance": {"source_id": "tableau-workbook:sales"},
+                "attributes": {},
+            },
+        ]
+    )
+    source["relations"].extend(
+        [
+            {
+                "from": "field:sales:revenue",
+                "type": "comes_from",
+                "to": "datasource:sales:orders",
+            },
+            {
+                "from": "field:sales:revenue-ytd",
+                "type": "calculated_by",
+                "to": "calculation:sales:revenue-ytd",
+            },
+            {
+                "from": "field:sales:revenue-ytd",
+                "type": "comes_from",
+                "to": "datasource:sales:orders",
+            },
+            {
+                "from": "field:sales:revenue-2",
+                "type": "comes_from",
+                "to": "datasource:sales:orders-2",
+            },
+            {
+                "from": "field:sales:revenue-ytd-2",
+                "type": "calculated_by",
+                "to": "calculation:sales:revenue-ytd-2",
+            },
+            {
+                "from": "field:sales:revenue-ytd-2",
+                "type": "comes_from",
+                "to": "datasource:sales:orders-2",
+            },
+            {
+                "from": "calculation:sales:revenue-ytd-2",
+                "type": "depends_on",
+                "to": "field:sales:revenue-2",
+            },
+            {
+                "from": "visual:sales:revenue-card-2",
+                "type": "uses",
+                "to": "calculation:sales:revenue-ytd-2",
+            },
+            {
+                "from": "dashboard:sales:executive",
+                "type": "contains",
+                "to": "visual:sales:revenue-card-2",
+            },
+            {
+                "from": "field:sales:revenue-3",
+                "type": "comes_from",
+                "to": "datasource:sales:orders-3",
+            },
+            {
+                "from": "field:sales:revenue-ytd-3",
+                "type": "calculated_by",
+                "to": "calculation:sales:revenue-ytd-3",
+            },
+            {
+                "from": "field:sales:revenue-ytd-3",
+                "type": "comes_from",
+                "to": "datasource:sales:orders-3",
+            },
+            {
+                "from": "calculation:sales:revenue-ytd-3",
+                "type": "depends_on",
+                "to": "field:sales:revenue-3",
+            },
+            {
+                "from": "visual:sales:revenue-card-3",
+                "type": "uses",
+                "to": "calculation:sales:revenue-ytd-3",
+            },
+            {
+                "from": "dashboard:sales:executive",
+                "type": "contains",
+                "to": "visual:sales:revenue-card-3",
+            },
+        ]
+    )
+    path.write_text(json.dumps(source), encoding="utf-8")
+
+
 class KnowledgeMcpCliTests(unittest.TestCase):
     def test_mcp_requirements_include_the_knowledge_loader_dependency(self) -> None:
         requirements = (PROJECT_ROOT / "requirements-mcp.txt").read_text(
@@ -251,7 +415,7 @@ class KnowledgeIndexTests(unittest.TestCase):
         dependencies = index.show_dependencies(
             "metric:sales:revenue", max_depth=3
         )
-        impact = index.impact_analysis("field:sales:revenue", max_depth=4)
+        impact = index.impact_analysis(["field:sales:revenue"], max_depth=4)
 
         self.assertEqual(
             used["used_by"][0]["entity"]["id"],
@@ -275,6 +439,71 @@ class KnowledgeIndexTests(unittest.TestCase):
         self.assertEqual(
             result["results"][0]["id"],
             "business-rule:sales:revenue-positive",
+        )
+
+    def test_search_disambiguates_repeated_calculations_by_datasource(self) -> None:
+        add_repeated_calculations(self.root)
+
+        result = self.index().search_entities(
+            "Revenue YTD", entity_type="calculation", limit=10
+        )
+
+        self.assertEqual(result["count"], 3)
+        self.assertIn("ambiguous", result)
+        self.assertTrue(result["ambiguous"])
+        self.assertEqual(len(result["ambiguity_groups"]), 1)
+        self.assertEqual(
+            set(result["ambiguity_groups"][0]["entity_ids"]),
+            {
+                "calculation:sales:revenue-ytd",
+                "calculation:sales:revenue-ytd-2",
+                "calculation:sales:revenue-ytd-3",
+            },
+        )
+        datasource_ids = {
+            item["datasources"][0]["id"] for item in result["results"]
+        }
+        self.assertEqual(
+            datasource_ids,
+            {
+                "datasource:sales:orders",
+                "datasource:sales:orders-2",
+                "datasource:sales:orders-3",
+            },
+        )
+        self.assertEqual(
+            {item["formula_preview"] for item in result["results"]},
+            {"SUM([Revenue])"},
+        )
+
+    def test_impact_analysis_unions_multiple_starting_entities(self) -> None:
+        add_repeated_calculations(self.root)
+        starting_ids = [
+            "calculation:sales:revenue-ytd",
+            "calculation:sales:revenue-ytd-2",
+            "calculation:sales:revenue-ytd-3",
+        ]
+
+        try:
+            result = self.index().impact_analysis(starting_ids, max_depth=4)
+        except TypeError as exc:
+            self.fail(f"impact_analysis must accept multiple IDs: {exc}")
+
+        self.assertEqual(
+            [item["id"] for item in result["starting_entities"]], starting_ids
+        )
+        impacted = {item["id"]: item for item in result["impacted_entities"]}
+        self.assertIn("visual:sales:revenue-card", impacted)
+        self.assertIn("visual:sales:revenue-card-2", impacted)
+        self.assertIn("visual:sales:revenue-card-3", impacted)
+        dashboard = impacted["dashboard:sales:executive"]
+        self.assertEqual(set(dashboard["reached_from"]), set(starting_ids))
+        self.assertEqual(
+            sum(
+                item["id"] == "dashboard:sales:executive"
+                for item in result["impacted_entities"]
+            ),
+            1,
         )
 
 
