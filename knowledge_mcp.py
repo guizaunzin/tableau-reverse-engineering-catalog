@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -21,6 +22,12 @@ from knowledge_build import (
 
 class KnowledgeMcpError(RuntimeError):
     """A clear, user-facing Knowledge MCP error."""
+
+
+MIN_PAGE_SIZE = 1
+MAX_PAGE_SIZE = 100
+MIN_TRAVERSAL_DEPTH = 1
+MAX_TRAVERSAL_DEPTH = 10
 
 
 @dataclass
@@ -122,14 +129,25 @@ class KnowledgeIndex:
 
     @staticmethod
     def _limit(value: int) -> int:
-        if value < 1 or value > 100:
-            raise KnowledgeMcpError("limit must be between 1 and 100")
+        if value < MIN_PAGE_SIZE or value > MAX_PAGE_SIZE:
+            raise KnowledgeMcpError(
+                f"limit must be between {MIN_PAGE_SIZE} and {MAX_PAGE_SIZE}"
+            )
+        return value
+
+    @staticmethod
+    def _offset(value: int) -> int:
+        if value < 0:
+            raise KnowledgeMcpError("offset must be zero or greater")
         return value
 
     @staticmethod
     def _depth(value: int) -> int:
-        if value < 1 or value > 10:
-            raise KnowledgeMcpError("max_depth must be between 1 and 10")
+        if value < MIN_TRAVERSAL_DEPTH or value > MAX_TRAVERSAL_DEPTH:
+            raise KnowledgeMcpError(
+                "max_depth must be between "
+                f"{MIN_TRAVERSAL_DEPTH} and {MAX_TRAVERSAL_DEPTH}"
+            )
         return value
 
     def search_entities(
@@ -137,9 +155,11 @@ class KnowledgeIndex:
         query: str,
         entity_type: str = "all",
         workbook: str | None = None,
+        offset: int = 0,
         limit: int = 10,
     ) -> dict[str, Any]:
         limit = self._limit(limit)
+        offset = self._offset(offset)
         if entity_type != "all" and entity_type not in ENTITY_DIRECTORIES:
             raise KnowledgeMcpError(f"Unsupported entity type: {entity_type}")
         needle = query.strip().casefold()
@@ -189,14 +209,19 @@ class KnowledgeIndex:
             for (entity_type_value, _), group in sorted(exact_groups.items())
             if len(group) > 1
         ]
+        page = matches[offset : offset + limit]
+        has_more = offset + len(page) < len(matches)
         return {
             "query": query,
-            "count": min(len(matches), limit),
+            "count": len(page),
             "total_matches": len(matches),
-            "truncated": len(matches) > limit,
+            "offset": offset,
+            "has_more": has_more,
+            "next_offset": offset + len(page) if has_more else None,
+            "truncated": has_more,
             "ambiguous": bool(ambiguity_groups),
             "ambiguity_groups": ambiguity_groups,
-            "results": matches[:limit],
+            "results": page,
         }
 
     def describe_entity(self, entity_id: str) -> dict[str, Any]:
@@ -300,12 +325,14 @@ class KnowledgeIndex:
         self,
         query: str,
         workbook: str | None = None,
+        offset: int = 0,
         limit: int = 10,
     ) -> dict[str, Any]:
         return self.search_entities(
             query,
             entity_type="business_rule",
             workbook=workbook,
+            offset=offset,
             limit=limit,
         )
 
@@ -326,6 +353,8 @@ def build_argument_parser() -> argparse.ArgumentParser:
 def create_mcp_server(index: KnowledgeIndex) -> Any:
     try:
         from mcp.server.fastmcp import FastMCP
+        from mcp.server.fastmcp.exceptions import ToolError
+        from mcp.types import ToolAnnotations
     except ImportError as exc:
         raise KnowledgeMcpError(
             "The optional MCP SDK is not installed. "
@@ -333,7 +362,7 @@ def create_mcp_server(index: KnowledgeIndex) -> Any:
         ) from exc
 
     server = FastMCP(
-        "Semantic Knowledge Base",
+        "knowledge_mcp",
         instructions=(
             "Read-only access to normalized dashboard semantics. Search before "
             "describing when an entity ID is unknown. Automatic metadata and "
@@ -343,61 +372,149 @@ def create_mcp_server(index: KnowledgeIndex) -> Any:
         ),
     )
 
-    @server.tool()
-    def search_entities(
+    read_only_annotations = ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    )
+
+    def call_index(
+        operation: Callable[..., dict[str, Any]],
+        /,
+        *args: Any,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        """Translate expected domain failures into MCP tool errors."""
+        try:
+            return operation(*args, **kwargs)
+        except KnowledgeMcpError as exc:
+            raise ToolError(str(exc)) from exc
+
+    @server.tool(
+        name="knowledge_search_entities",
+        title="Search Knowledge Entities",
+        annotations=read_only_annotations,
+    )
+    def knowledge_search_entities(
         query: str,
         entity_type: str = "all",
         workbook: str | None = None,
+        offset: int = 0,
         limit: int = 10,
     ) -> dict[str, Any]:
-        """Search entities by text, type, and workbook.
+        """Search knowledge entities by text, type, and workbook.
 
         Do not choose arbitrarily when ambiguous is true. Pass every relevant
-        exact-match ID to impact_analysis or ask the user to select.
+        exact-match ID to knowledge_analyze_impact or ask the user to select.
+
+        Args:
+            query: Text to match in IDs, names, metadata, and manual context.
+            entity_type: Entity type to include, or "all" for every type.
+            workbook: Optional exact workbook name or source ID.
+            offset: Zero-based result offset for pagination.
+            limit: Page size between 1 and 100.
         """
-        return index.search_entities(
+        return call_index(
+            index.search_entities,
             query,
             entity_type=entity_type,
             workbook=workbook,
+            offset=offset,
             limit=limit,
         )
 
-    @server.tool()
-    def describe_entity(entity_id: str) -> dict[str, Any]:
-        """Describe one entity with automatic, manual, and relationship context."""
-        return index.describe_entity(entity_id)
+    @server.tool(
+        name="knowledge_describe_entity",
+        title="Describe Knowledge Entity",
+        annotations=read_only_annotations,
+    )
+    def knowledge_describe_entity(entity_id: str) -> dict[str, Any]:
+        """Describe an entity with automatic, manual, and relation context.
 
-    @server.tool()
-    def where_is_used(entity_id: str) -> dict[str, Any]:
-        """List the direct entities and relation types that use an entity."""
-        return index.where_is_used(entity_id)
+        Args:
+            entity_id: Exact entity ID returned by knowledge_search_entities.
+        """
+        return call_index(index.describe_entity, entity_id)
 
-    @server.tool()
-    def show_dependencies(
+    @server.tool(
+        name="knowledge_where_is_used",
+        title="Find Direct Knowledge Consumers",
+        annotations=read_only_annotations,
+    )
+    def knowledge_where_is_used(entity_id: str) -> dict[str, Any]:
+        """List direct entities and relation types that use an entity.
+
+        Args:
+            entity_id: Exact entity ID whose direct consumers are needed.
+        """
+        return call_index(index.where_is_used, entity_id)
+
+    @server.tool(
+        name="knowledge_show_dependencies",
+        title="Show Knowledge Dependencies",
+        annotations=read_only_annotations,
+    )
+    def knowledge_show_dependencies(
         entity_id: str, max_depth: int = 3
     ) -> dict[str, Any]:
-        """Trace bounded upstream dependencies for an entity."""
-        return index.show_dependencies(entity_id, max_depth=max_depth)
+        """Trace bounded upstream dependencies for an entity.
 
-    @server.tool()
-    def impact_analysis(
+        Args:
+            entity_id: Exact entity ID whose dependencies are needed.
+            max_depth: Maximum traversal depth between 1 and 10.
+        """
+        return call_index(
+            index.show_dependencies, entity_id, max_depth=max_depth
+        )
+
+    @server.tool(
+        name="knowledge_analyze_impact",
+        title="Analyze Knowledge Impact",
+        annotations=read_only_annotations,
+    )
+    def knowledge_analyze_impact(
         entity_ids: list[str], max_depth: int = 3
     ) -> dict[str, Any]:
         """Trace downstream impact for one or more starting entity IDs.
 
         Pass all candidates from a relevant search ambiguity group. Results
         are deduplicated and retain their starting IDs in reached_from.
-        """
-        return index.impact_analysis(entity_ids, max_depth=max_depth)
 
-    @server.tool()
-    def find_business_rules(
+        Args:
+            entity_ids: Non-empty list of exact starting entity IDs.
+            max_depth: Maximum traversal depth between 1 and 10.
+        """
+        return call_index(
+            index.impact_analysis, entity_ids, max_depth=max_depth
+        )
+
+    @server.tool(
+        name="knowledge_find_business_rules",
+        title="Find Knowledge Business Rules",
+        annotations=read_only_annotations,
+    )
+    def knowledge_find_business_rules(
         query: str,
         workbook: str | None = None,
+        offset: int = 0,
         limit: int = 10,
     ) -> dict[str, Any]:
-        """Search inferred and manual business rules, including human context."""
-        return index.find_business_rules(query, workbook=workbook, limit=limit)
+        """Search inferred and manual business rules with human context.
+
+        Args:
+            query: Text to match in inferred rules and manual context.
+            workbook: Optional exact workbook name or source ID.
+            offset: Zero-based result offset for pagination.
+            limit: Page size between 1 and 100.
+        """
+        return call_index(
+            index.find_business_rules,
+            query,
+            workbook=workbook,
+            offset=offset,
+            limit=limit,
+        )
 
     return server
 
