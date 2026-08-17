@@ -6,10 +6,12 @@ import json
 import subprocess
 import sys
 import tempfile
+import tomllib
 import unittest
 from pathlib import Path
 
 import knowledge_mcp
+from mcp_rules_generator import generate_rules
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -305,6 +307,7 @@ class KnowledgeMcpCliTests(unittest.TestCase):
 
         self.assertIn("mcp>=1.28,<2", requirements)
         self.assertIn("PyYAML", requirements)
+        self.assertIn("tomli-w", requirements)
 
     def test_check_loads_the_v2_knowledge_base_without_starting_mcp(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -334,6 +337,7 @@ class KnowledgeMcpCliTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir) / "knowledge"
             write_knowledge(root)
+            generate_rules(root)
 
             async def scenario() -> None:
                 from mcp import ClientSession, StdioServerParameters
@@ -353,6 +357,8 @@ class KnowledgeMcpCliTests(unittest.TestCase):
                                 "knowledge_analyze_impact",
                                 "knowledge_describe_entity",
                                 "knowledge_find_business_rules",
+                                "knowledge_get_rules_context",
+                                "knowledge_list_rule_scopes",
                                 "knowledge_search_entities",
                                 "knowledge_show_dependencies",
                                 "knowledge_where_is_used",
@@ -384,6 +390,22 @@ class KnowledgeMcpCliTests(unittest.TestCase):
                         self.assertEqual(
                             result.structuredContent["results"][0]["id"],
                             "metric:sales:revenue",
+                        )
+
+                        scopes = await session.call_tool(
+                            "knowledge_list_rule_scopes", {"workbook": "Sales"}
+                        )
+                        self.assertFalse(scopes.isError)
+                        self.assertEqual(scopes.structuredContent["count"], 2)
+
+                        context = await session.call_tool(
+                            "knowledge_get_rules_context",
+                            {"scope_id": "dashboard:sales:executive"},
+                        )
+                        self.assertFalse(context.isError)
+                        self.assertEqual(
+                            context.structuredContent["scope"]["id"],
+                            "dashboard:sales:executive",
                         )
 
                         error = await session.call_tool(
@@ -469,6 +491,47 @@ class KnowledgeIndexTests(unittest.TestCase):
             result["results"][0]["id"],
             "business-rule:sales:revenue-positive",
         )
+
+    def test_lists_and_returns_generated_rule_contexts(self) -> None:
+        generate_rules(self.root)
+        index = self.index()
+
+        scopes = index.list_rule_scopes(workbook="Sales")
+        context = index.get_rules_context("dashboard:sales:executive")
+
+        self.assertEqual(scopes["count"], 2)
+        self.assertEqual(
+            {item["id"] for item in scopes["results"]},
+            {"tableau-workbook:sales", "dashboard:sales:executive"},
+        )
+        self.assertEqual(context["scope"]["id"], "dashboard:sales:executive")
+        self.assertEqual(context["mcp_rules_version"], 1)
+        self.assertEqual(
+            context["rules"][0]["id"],
+            "business-rule:sales:revenue-positive",
+        )
+        expected = tomllib.loads(
+            (
+                self.root
+                / "mcp_rules"
+                / "dashboards"
+                / "sales"
+                / "executive.toml"
+            ).read_text(encoding="utf-8")
+        )
+        self.assertEqual(context, expected)
+
+    def test_refuses_to_load_stale_rule_contexts(self) -> None:
+        generate_rules(self.root)
+        source_path = self.root / "sources" / "tableau" / "sales.json"
+        source = json.loads(source_path.read_text(encoding="utf-8"))
+        source["entities"][2]["name"] = "Recognized Revenue"
+        source_path.write_text(json.dumps(source), encoding="utf-8")
+
+        with self.assertRaisesRegex(
+            knowledge_mcp.KnowledgeMcpError, "stale MCP rule context"
+        ):
+            knowledge_mcp.KnowledgeIndex.load(self.root)
 
     def test_search_disambiguates_repeated_calculations_by_datasource(self) -> None:
         add_repeated_calculations(self.root)

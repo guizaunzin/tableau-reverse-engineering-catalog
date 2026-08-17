@@ -8,6 +8,7 @@ docs/
 !/tests/test_knowledge_build.py
 !/tests/test_knowledge_mcp.py
 !/tests/test_tableau_knowledge.py
+!/tests/test_mcp_rules_generator.py
 semantic_config.json
 semantic_config.draft.json
 /.venv-analytics/
