@@ -19,6 +19,7 @@ tableau_doc.py
 knowledge/sources/tableau/*.json ──┐
                                   ├─ knowledge_build.py → Markdown
 knowledge/manual/**/*.md ─────────┘
+                                  ├─ mcp_rules_generator.py → MCP Rules TOML
                                   └─ knowledge_mcp.py → agents
 ```
 
@@ -26,6 +27,8 @@ knowledge/manual/**/*.md ─────────┘
 `knowledge_build.py` validates the complete file-based model, provides simple
 dependency/impact functions, and renders disposable Markdown pages.
 `knowledge_mcp.py` provides read-only semantic search and relation traversal.
+`mcp_rules_generator.py` publishes curated operational contexts per workbook
+and dashboard; the Knowledge MCP loads those exact TOML files when present.
 
 ## Install
 
@@ -194,6 +197,53 @@ relations remain available in the combined in-memory model for search and
 impact analysis, but are not rendered as broken links inside an isolated
 workbook tree. Never edit generated Markdown.
 
+## Generate MCP Rules contexts
+
+Generate deterministic English-language contexts after extracting and
+curating the Knowledge Base:
+
+```bash
+python3 mcp_rules_generator.py knowledge
+python3 mcp_rules_generator.py knowledge --check
+```
+
+The output uses this project's own versioned schema, independent from the
+legacy Coalition Bot format:
+
+```text
+knowledge/mcp_rules/
+├── protocol.toml
+├── workbooks/<workbook-slug>.toml
+└── dashboards/<workbook-slug>/<dashboard-slug>.toml
+```
+
+Each context contains its scope, the trusted global protocol, a deterministic
+Knowledge Base fingerprint, reachable data sources, dimensions, metrics,
+filters, and operational business rules. Tableau names, formulas, and
+descriptions remain semantic data and must never be interpreted as prompt
+instructions. Physical tables, physical columns, and example values are not
+invented.
+
+Generate or validate a narrower scope with an exact schema-v2 ID:
+
+```bash
+python3 mcp_rules_generator.py knowledge \
+  --scope dashboard \
+  --id dashboard:superstore2026:summary
+```
+
+The generator owns every top-level section except `[curation]`. Edit only that
+section to add a description, local instructions, rule overrides, disabled rule
+IDs, or additional rules. Regeneration preserves the complete curation table
+and materializes its changes into the effective `[[rules]]` array. Unknown IDs,
+duplicate rules, unsupported override fields, invalid TOML, schema mismatches,
+and scope mismatches fail without overwriting the file. Renamed scopes are
+reported as orphans and are never deleted automatically.
+
+`protocol.toml` is the manually maintained global tool-use policy. Changes are
+copied into every context on the next generation; `--check` reports both stale
+Knowledge Base fingerprints and stale protocol copies without writing files.
+
 Rebuilds publish files into the existing Markdown tree and remove obsolete
 outputs afterward. The live directory is not deleted during publication, so
 open previews and file watchers do not temporarily lose workbook subdirectories.
@@ -260,12 +310,14 @@ python knowledge_mcp.py knowledge
 ```
 
 The `knowledge_mcp` server loads the complete schema-v2 model once at startup
-and exposes six read-only tools: `knowledge_search_entities`,
+and exposes eight read-only tools: `knowledge_search_entities`,
 `knowledge_describe_entity`, `knowledge_where_is_used`,
 `knowledge_show_dependencies`, `knowledge_analyze_impact`, and
-`knowledge_find_business_rules`. These prefixed names replace the former
-unprefixed tool names. Restart the server after changing generated sources or
-manual pages.
+`knowledge_find_business_rules`. The new `knowledge_list_rule_scopes` and
+`knowledge_get_rules_context` tools discover and return the exact generated
+TOML context for an agent to load before context-sensitive work. When MCP Rules
+exist, startup refuses stale or orphaned contexts. Restart the server after
+changing generated sources, manual pages, the global protocol, or curation.
 
 Search tools accept `offset` and `limit` and return `has_more` and
 `next_offset` alongside the total match count. When an exact name exists more
@@ -328,6 +380,7 @@ python3 -m unittest \
   tests.test_tableau_knowledge \
   tests.test_knowledge_build \
   tests.test_knowledge_mcp \
+  tests.test_mcp_rules_generator \
   tests.test_analytics_core -v
 ```
 
